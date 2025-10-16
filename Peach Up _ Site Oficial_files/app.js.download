@@ -1,0 +1,4071 @@
+/**
+ * Vidget 3.0 - Widget de vídeo interativo modernizado
+ * Versão Next.js com UX/UI moderna, transições tipo Reels/Stories
+ * Compatível com iOS, Android e todos os navegadores mobile
+ */
+
+console.log('%cVidget%c3.0', 'padding:2px 6px; color: #00ff88; background: linear-gradient(45deg, #1a1a1a, #333); border-radius: 4px; font-weight: bold;', 'padding:2px 6px 2px 0px; color: #ff6b6b; background: linear-gradient(45deg, #333, #1a1a1a); border-radius: 4px; font-weight: bold;');
+
+// ========================= CONFIGURAÇÕES GLOBAIS =========================
+const VIDGET_CONFIG = {
+    // URLs da API e Storage
+    STORAGE_URL: 'https://phxkpzehxsbteunlmdoq.supabase.co/storage/v1/object/public/vidget::videos',
+    SUPABASE_URL: 'https://phxkpzehxsbteunlmdoq.supabase.co',
+    SUPABASE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBoeGtwemVoeHNidGV1bmxtZG9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDMxNjg2MDcsImV4cCI6MjAxODc0NDYwN30.oEfBNB49pgdWuGIDYoZf78J9nzZyzrfwZ6cX_OPOF3A',
+
+    // Configurações de comportamento
+    METRICS_UPDATE_INTERVAL: 10,
+    SWIPE_THRESHOLD: 80,
+    SWIPE_VELOCITY_THRESHOLD: 0.3,
+    MOBILE_BREAKPOINT: 768,
+    HIDE_TIMEOUT: 20000,
+    PRELOAD_ADJACENT_COUNT: 2,
+
+    // Configurações de transição
+    TRANSITION_DURATION: 400,
+    PROGRESS_UPDATE_INTERVAL: 50,
+    AUTO_ADVANCE_DELAY: 100,
+
+    // Métricas e analytics
+    SESSION_STORAGE_KEY: 'vidget_session_id',
+    METRICS_BATCH_SIZE: 5,
+    COMPLETION_BUCKETS: {
+        LOW: "0-25",
+        MID_LOW: "26-50",
+        MID_HIGH: "51-75",
+        HIGH: "76-100"
+    },
+
+    // Assets e ícones
+    ASSETS_BASE: 'https://app.vidget.com.br/',
+    ICONS: {
+        CLOSE: 'https://app.vidget.com.br/i-close-icon-2.svg',
+        CLOSE_MOBILE: 'https://app.vidget.com.br/i-close-icon-2.svg',
+        SOUND: 'https://app.vidget.com.br/i-sound.svg',
+        SOUND_MOBILE: 'https://app.vidget.com.br/i-sound.svg',
+        MUTE: 'https://app.vidget.com.br/i-mute.svg',
+        MUTE_MOBILE: 'https://app.vidget.com.br/i-mute.svg',
+        PREV: 'https://app.vidget.com.br/i-prev-arrow-2.svg',
+        NEXT: 'https://app.vidget.com.br/i-next-arrow-2.svg',
+        SHARE: 'https://app.vidget.com.br/i-whats-white.svg',
+        COPY_LINK: 'https://app.vidget.com.br/i-share-white.svg',
+        COPY: 'https://app.vidget.com.br/i-copy-blue.svg',
+        WHATSAPP: 'https://app.vidget.com.br/i-whatsapp.svg',
+        PLAY: 'https://app.vidget.com.br/i-play.svg'
+    }
+};
+
+const CACHE_CONFIG = {
+    VIDEO_CACHE_DURATION: 5 * 60 * 1000, // 5 minutos
+    MAX_CACHE_ITEMS: 20
+};
+
+class LocalCache {
+    constructor() {
+        this.cache = new Map();
+        this.timestamps = new Map();
+    }
+
+    set(key, value) {
+        this.cache.set(key, value);
+        this.timestamps.set(key, Date.now());
+        this.cleanup();
+    }
+
+    get(key) {
+        const timestamp = this.timestamps.get(key);
+        if (!timestamp || Date.now() - timestamp > CACHE_CONFIG.VIDEO_CACHE_DURATION) {
+            this.cache.delete(key);
+            this.timestamps.delete(key);
+            return null;
+        }
+        return this.cache.get(key);
+    }
+
+    cleanup() {
+        if (this.cache.size > CACHE_CONFIG.MAX_CACHE_ITEMS) {
+            const oldestKey = [...this.timestamps.entries()]
+                .sort((a, b) => a[1] - b[1])[0][0];
+            this.cache.delete(oldestKey);
+            this.timestamps.delete(oldestKey);
+        }
+    }
+}
+
+// ========================= ESTADO GLOBAL =========================
+let globalState = {
+    // Core
+    supabaseInstance: null,
+    localCache: new LocalCache(),
+    sessionId: null,
+
+    // Vídeos e reprodução
+    videoSet: [],
+    currentVideoIndex: 0,
+    currentVideoElement: null,
+    isChangingVideo: false,
+    isProcessingSwipe: false,
+
+    // Interface
+    vidgetContainer: null,
+    isExpanded: false,
+    isDragging: false,
+    toggleLock: false,
+
+    // Métricas
+    lastTimeUpdate: 0,
+    startTime: null,
+    metricsBuffer: [],
+    watchedSegments: new Set(),
+    currentSession: {
+        startTime: Date.now(),
+        totalWatchTime: 0,
+        videoInteractions: [],
+        completedVideos: new Set()
+    },
+
+    // Touch e gestos
+    touchStartY: 0,
+    touchStartX: 0,
+    mouseStartX: 0,
+    mouseStartY: 0,
+    lastTouchY: 0,
+    dragStartTime: null,
+    swipeDirection: null,
+
+    // Timers e intervalos
+    progressInterval: null,
+    hideTimeout: null,
+    preloadTimeout: null,
+
+    // Configurações de dispositivo
+    isMobile: false,
+    isIOS: false,
+    isAndroid: false,
+    isSafari: false,
+    supportsTouchEvents: false,
+    supportsIntersectionObserver: false
+};
+
+// ========================= DETECÇÃO DE DISPOSITIVO =========================
+function detectDevice() {
+    const userAgent = navigator.userAgent.toLowerCase();
+    const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+    globalState.isMobile = (window.innerWidth <= VIDGET_CONFIG.MOBILE_BREAKPOINT || isTouchDevice) && /android|iphone|ipad|ipod|blackberry|windows phone/i.test(userAgent);
+    globalState.isIOS = /iphone|ipad|ipod|ios/.test(userAgent);
+    globalState.isAndroid = /android/.test(userAgent);
+
+    // 🎯 ADICIONAR ESTA LINHA:
+    globalState.isSafari = /^((?!chrome|android).)*safari/i.test(userAgent) || globalState.isIOS;
+
+    globalState.supportsTouchEvents = isTouchDevice;
+    globalState.supportsIntersectionObserver = 'IntersectionObserver' in window;
+
+    console.log('Dispositivo detectado:', {
+        isMobile: globalState.isMobile,
+        isIOS: globalState.isIOS,
+        isAndroid: globalState.isAndroid,
+        isSafari: globalState.isSafari, // 🎯 ADICIONAR AO LOG
+        supportsTouchEvents: globalState.supportsTouchEvents
+    });
+}
+
+// ========================= SISTEMA DE SESSÃO E MÉTRICAS =========================
+class SessionManager {
+    constructor() {
+        this.sessionId = this.generateSessionId();
+        this.startTime = Date.now();
+        this.events = [];
+        this.isActive = true;
+
+        this.setupVisibilityHandlers();
+        this.setupBeforeUnloadHandlers();
+    }
+
+    generateSessionId() {
+        return 'vidget_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    }
+
+    trackEvent(type, data) {
+        const event = {
+            id: this.generateEventId(),
+            sessionId: this.sessionId,
+            type,
+            timestamp: Date.now(),
+            data: { ...data },
+            url: window.location.href
+        };
+
+        this.events.push(event);
+
+        // Processar eventos imediatamente para eventos críticos
+        if (['video_start', 'video_complete', 'click', 'share'].includes(type)) {
+            this.flushEvents();
+        }
+
+        // Flush periódico para outros eventos
+        if (this.events.length >= VIDGET_CONFIG.METRICS_BATCH_SIZE) {
+            this.flushEvents();
+        }
+    }
+
+    generateEventId() {
+        return Date.now().toString(36) + Math.random().toString(36).substr(2);
+    }
+
+    async flushEvents() {
+        if (this.events.length === 0) return;
+
+        const eventsToSend = [...this.events];
+        this.events = [];
+
+        try {
+            await this.sendMetrics(eventsToSend);
+        } catch (error) {
+            console.warn('Falha ao enviar métricas, recolocando na fila:', error);
+            this.events.unshift(...eventsToSend);
+        }
+    }
+
+    async sendMetrics(events) {
+        if (!globalState.supabaseInstance || events.length === 0) return;
+
+        // Processar eventos por vídeo
+        const videoMetrics = this.aggregateEventsByVideo(events);
+
+        for (const [videoId, metrics] of Object.entries(videoMetrics)) {
+            try {
+                await this.updateVideoMetrics(videoId, metrics);
+            } catch (error) {
+                console.error(`Erro ao atualizar métricas para vídeo ${videoId}:`, error);
+            }
+        }
+    }
+
+    aggregateEventsByVideo(events) {
+        const videoMetrics = {};
+
+        events.forEach(event => {
+            const videoId = event.data.videoId;
+            if (!videoId) return;
+
+            if (!videoMetrics[videoId]) {
+                videoMetrics[videoId] = {
+                    sessionId: this.sessionId,
+                    events: [],
+                    totalWatchTime: 0,
+                    views: 0,
+                    clicks: 0,
+                    completions: 0,
+                    completionRates: { ...VIDGET_CONFIG.COMPLETION_BUCKETS },
+                    lastUpdate: Date.now()
+                };
+
+                // Resetar completion rates
+                Object.keys(videoMetrics[videoId].completionRates).forEach(key => {
+                    videoMetrics[videoId].completionRates[key] = 0;
+                });
+            }
+
+            const metrics = videoMetrics[videoId];
+            metrics.events.push(event);
+
+            switch (event.type) {
+                case 'video_start':
+                    metrics.views++;
+                    break;
+                case 'watch_time':
+                    metrics.totalWatchTime += event.data.timeWatched || 0;
+                    if (event.data.completionPercentage) {
+                        const bucket = this.getCompletionBucket(event.data.completionPercentage);
+                        if (bucket && metrics.completionRates[bucket] !== undefined) {
+                            metrics.completionRates[bucket]++;
+                        }
+                    }
+                    break;
+                case 'click':
+                    metrics.clicks++;
+                    break;
+                case 'video_complete':
+                    metrics.completions++;
+                    break;
+            }
+        });
+
+        return videoMetrics;
+    }
+
+    getCompletionBucket(percentage) {
+        if (percentage <= 25) return "0-25";
+        if (percentage <= 50) return "26-50";
+        if (percentage <= 75) return "51-75";
+        return "76-100";
+    }
+
+    async updateVideoMetrics(videoId, metrics) {
+        try {
+            // Usar diretamente o método legacy otimizado
+            await this.updateVideoMetricsLegacy(videoId, metrics);
+        } catch (error) {
+            console.error('Erro ao atualizar métricas do vídeo:', error);
+            // Armazenar para retry
+            this.storeMetricsForRetry(videoId, metrics);
+        }
+    }
+
+    async updateVideoMetricsLegacy(videoId, metrics) {
+        // Manter código original como fallback, mas com timeout menor
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Timeout')), 5000)
+        );
+
+        try {
+            await Promise.race([
+                this.updateVideoMetricsOriginal(videoId, metrics),
+                timeoutPromise
+            ]);
+        } catch (error) {
+            console.warn('Métricas não atualizadas devido a timeout/erro:', error);
+            // Armazenar métricas localmente para retry posterior
+            this.storeMetricsForRetry(videoId, metrics);
+        }
+    }
+
+    async updateVideoMetricsOriginal(videoId, metrics) {
+        const videoIndexInSet = globalState.videoSet.findIndex(v => v.id === videoId);
+        const currentVideoId = `video_${videoIndexInSet + 1}`;
+        const currentDate = new Date().toISOString().split('T')[0];
+
+        const { data, error: fetchError } = await globalState.supabaseInstance
+            .from('vidget::videos')
+            .select('metadata')
+            .eq('id', videoId)
+            .single();
+
+        if (fetchError) throw fetchError;
+
+        // Inicializar estrutura de métricas se necessário
+        if (!data.metadata.metrics) {
+            data.metadata.metrics = {};
+        }
+
+        if (!data.metadata.metrics[currentVideoId]) {
+            data.metadata.metrics[currentVideoId] = {
+                duration: globalState.currentVideoElement?.duration || 0,
+                totalViews: 0,
+                totalClicks: 0,
+                totalWatchTime: 0,
+                totalCompletions: 0,
+                averageWatchTime: 0,
+                dailyMetrics: {},
+                completionRates: {
+                    "0-25": 0,
+                    "26-50": 0,
+                    "51-75": 0,
+                    "76-100": 0
+                },
+                sessions: {}
+            };
+        }
+
+        const videoMetrics = data.metadata.metrics[currentVideoId];
+
+        // Atualizar métricas
+        videoMetrics.totalViews += metrics.views || 0;
+        videoMetrics.totalClicks += metrics.clicks || 0;
+        videoMetrics.totalWatchTime += metrics.totalWatchTime || 0;
+        videoMetrics.totalCompletions += metrics.completions || 0;
+
+        // Salvar no banco
+        const { error: updateError } = await globalState.supabaseInstance
+            .from('vidget::videos')
+            .update({ metadata: data.metadata })
+            .eq('id', videoId);
+
+        if (updateError) throw updateError;
+    }
+
+    storeMetricsForRetry(videoId, metrics) {
+        const retryKey = 'vidget_retry_metrics';
+        const existing = JSON.parse(localStorage.getItem(retryKey) || '[]');
+        existing.push({
+            videoId,
+            metrics,
+            timestamp: Date.now(),
+            sessionId: this.sessionId
+        });
+        localStorage.setItem(retryKey, JSON.stringify(existing.slice(-10))); // Manter apenas 10 últimas
+    }
+
+    async retryFailedMetrics() {
+        const retryKey = 'vidget_retry_metrics';
+        const failed = JSON.parse(localStorage.getItem(retryKey) || '[]');
+
+        if (failed.length === 0) return;
+
+        const successful = [];
+        for (const item of failed) {
+            try {
+                await this.updateVideoMetrics(item.videoId, item.metrics);
+                successful.push(item);
+            } catch (error) {
+                console.warn('Retry falhou:', error);
+            }
+        }
+
+        // Remover métricas que foram enviadas com sucesso
+        const remaining = failed.filter(item => !successful.includes(item));
+        localStorage.setItem(retryKey, JSON.stringify(remaining));
+    }
+
+
+    setupVisibilityHandlers() {
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                this.isActive = false;
+                this.flushEvents();
+            } else {
+                this.isActive = true;
+            }
+        });
+    }
+
+    setupBeforeUnloadHandlers() {
+        window.addEventListener('beforeunload', () => {
+            this.flushEvents();
+        });
+
+        window.addEventListener('pagehide', () => {
+            this.flushEvents();
+        });
+    }
+}
+
+// ========================= UTILITÁRIOS =========================
+const VidgetUtils = {
+    // Adicionar Google Fonts
+    addGoogleFonts() {
+        if (document.querySelector('#vidget-fonts')) return;
+
+        const fontLink = document.createElement('link');
+        fontLink.id = 'vidget-fonts';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap';
+        fontLink.rel = 'stylesheet';
+        document.head.appendChild(fontLink);
+    },
+
+    // Injetar CSS
+    injectCSS(cssString, id = null) {
+        if (id && document.querySelector(`#${id}`)) return;
+
+        const style = document.createElement('style');
+        if (id) style.id = id;
+        style.textContent = cssString;
+        document.head.appendChild(style);
+    },
+
+    // Normalizar URLs
+    normalizeUrl(url, removeWWW = true) {
+        if (!url) return '';
+
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            url = 'https://' + url;
+        }
+
+        try {
+            const urlObj = new URL(url);
+            let hostname = removeWWW ? urlObj.hostname.replace(/^www\./, '') : urlObj.hostname;
+            let normalizedUrl = urlObj.protocol + '//' + hostname + urlObj.pathname;
+            normalizedUrl = normalizedUrl.replace(/\/$/, '').toLowerCase();
+
+            if (urlObj.pathname === '/busca' || urlObj.searchParams.has('variant_id')) {
+                normalizedUrl += urlObj.search;
+            }
+
+            return normalizedUrl;
+        } catch (error) {
+            console.error('Erro ao normalizar URL:', error);
+            return url.toLowerCase();
+        }
+    },
+
+    // Converter texto em links
+    convertTextToLinks(text) {
+        if (!text) return '';
+
+        const urlRegex = /(\bhttps?:\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|]|(?:\b[a-z][a-z0-9-]*\.)+[a-z]{2,}\/[-A-Z0-9+&@#\/%=~_|!:,.;]*\/?)/ig;
+
+        return text.replace(urlRegex, (url) => {
+            const href = /^https?:\/\//i.test(url) ? url : `http://${url}`;
+            const displayUrl = url.replace(/^https?:\/\//, '');
+            return `<a href="${href}" target="_blank" rel="noopener noreferrer" style="color: #fff; text-decoration: underline; font-weight: 500;">${displayUrl}</a>`;
+        });
+    },
+
+    // Debounce
+    debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
+    },
+
+    // Throttle
+    throttle(func, limit) {
+        let inThrottle;
+        return function () {
+            const args = arguments;
+            const context = this;
+            if (!inThrottle) {
+                func.apply(context, args);
+                inThrottle = true;
+                setTimeout(() => inThrottle = false, limit);
+            }
+        };
+    },
+
+    // Preload de vídeos
+    preloadVideo(videoUrl) {
+        return new Promise((resolve, reject) => {
+            const video = document.createElement('video');
+            video.preload = 'metadata';
+            video.crossOrigin = 'anonymous';
+
+            const cleanup = () => {
+                video.removeEventListener('loadedmetadata', onLoad);
+                video.removeEventListener('error', onError);
+            };
+
+            const onLoad = () => {
+                cleanup();
+                resolve(video);
+            };
+
+            const onError = () => {
+                cleanup();
+                reject(new Error('Falha ao carregar vídeo'));
+            };
+
+            video.addEventListener('loadedmetadata', onLoad);
+            video.addEventListener('error', onError);
+
+            video.src = videoUrl;
+        });
+    },
+
+    // Animações CSS com GPU
+    animateElement(element, keyframes, options = {}) {
+        const defaultOptions = {
+            duration: VIDGET_CONFIG.TRANSITION_DURATION,
+            easing: 'cubic-bezier(0.4, 0, 0.2, 1)',
+            fill: 'forwards'
+        };
+
+        const animation = element.animate(keyframes, { ...defaultOptions, ...options });
+
+        return new Promise((resolve) => {
+            animation.addEventListener('finish', resolve);
+        });
+    },
+
+    // Haptic feedback (apenas iOS Safari)
+    hapticFeedback(type = 'light') {
+        if (globalState.isIOS && window.navigator && window.navigator.vibrate) {
+            const patterns = {
+                light: [10],
+                medium: [20],
+                heavy: [30]
+            };
+            window.navigator.vibrate(patterns[type] || patterns.light);
+        }
+    }
+};
+
+// ========================= ESTILOS MODERNOS =========================
+const VidgetStyles = {
+    // CSS Base com design system moderno
+    baseCSS: `
+    :root {
+      --vidget-primary: #6366f1;
+      --vidget-primary-dark: #4f46e5;
+      --vidget-success: #10b981;
+      --vidget-warning: #f59e0b;
+      --vidget-error: #ef4444;
+      --vidget-text: #ffffff;
+      --vidget-text-secondary: rgba(255, 255, 255, 0.7);
+      --vidget-bg-overlay: rgba(0, 0, 0, 0.4);
+      --vidget-bg-glass: rgba(255, 255, 255, 0.1);
+      --vidget-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      --vidget-border-radius: 16px;
+      --vidget-border-radius-lg: 24px;
+      --vidget-transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      --vidget-backdrop-blur: blur(20px);
+    }
+
+    #vidget__container {
+      width: 24vw;
+      height: calc(24vw * 1.7692);
+      position: fixed;
+      z-index: 999999999;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      font-weight: 400;
+      
+      overflow: hidden;
+      border-radius: var(--vidget-border-radius);
+      background: var(--vidget-bg-overlay);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      transition: var(--vidget-transition);
+      opacity: 0;
+      visibility: hidden;
+      transform: scale(0.8) translateY(20px);
+      box-shadow: var(--vidget-shadow);
+      will-change: transform, opacity;
+      contain: layout paint;
+    }
+
+    #vidget__container.loaded {
+      opacity: 1;
+      visibility: visible;
+      transform: scale(1) translateY(0);
+    }
+
+    #vidget__container.minimized {
+      border-radius: 50% !important;
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    #vidget__container.shadow-applied.loaded:not(.minimized) {
+      border-radius: var(--vidget-border-radius) !important;
+      bottom: 20px !important;
+    }
+
+    #vidget__container.minimized.size-p {
+      width: 6vw !important;
+      height: 6vw !important;
+    }
+
+    #vidget__container.minimized.size-m {
+      width: 8vw !important;
+      height: 8vw !important;
+    }
+
+    #vidget__container.minimized.size-g {
+      width: 12vw !important;
+      height: 12vw !important;
+    }
+
+    /* Responsivo para mobile */
+    @media screen and (max-width: 768px) {
+      #vidget__container {
+        width: 100% !important;
+        height: 100% !important;
+        bottom: 0;
+        right: 0;
+        left: 0 ;
+        top: 0 !important;
+        border-radius: 0 !important;
+        z-index: 99999999999;
+      }
+
+      #vidget__container.minimized {
+        width: 20vw !important;
+        height: 20vw !important;
+        bottom: 20px;
+        right: auto;       
+        left: auto;       
+        top: auto !important;
+        border-radius: 50% !important;
+        
+      }
+
+      #vidget__container.minimized.size-p,
+      #vidget__container.minimized.size-m,
+      #vidget__container.minimized.size-g {
+        width: 20vw !important;
+        height: 20vw !important;
+      }
+    }
+
+    /* Safe area para iOS */
+    @supports (padding: max(0px)) {
+      @media screen and (max-width: 768px) {
+        #vidget__container {
+          padding-bottom: max(0px, env(safe-area-inset-bottom));
+          padding-left: max(0px, env(safe-area-inset-left));
+          padding-right: max(0px, env(safe-area-inset-right));
+        }
+      }
+    }
+  `,
+
+    // Progress Bar estilo Stories
+    progressBarCSS: `
+  .vidget__progress-container {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    right: 16px;
+    z-index: 999999;
+    display: flex;
+    gap: 4px;
+    height: 3px;
+  }
+
+  .vidget__progress-bar {
+    flex: 1;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 2px;
+    overflow: hidden;
+    position: relative;
+    backdrop-filter: blur(4px);
+  }
+
+  .vidget__progress-bar .progress-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #fff, rgba(255, 255, 255, 0.9));
+    border-radius: 2px;
+    transition: none;
+    box-shadow: 0 0 8px rgba(255, 255, 255, 0.4);
+    will-change: width;
+  }
+
+  .vidget__progress-bar.active .progress-fill {
+    animation: progress-glow 1s ease-in-out infinite alternate;
+  }
+
+  .vidget__progress-bar.completed .progress-fill {
+    width: 100% !important;
+    background: #fff;
+  }
+
+  @keyframes progress-glow {
+    0% { box-shadow: 0 0 8px rgba(255, 255, 255, 0.4); }
+    100% { box-shadow: 0 0 16px rgba(255, 255, 255, 0.8); }
+  }
+
+  @media screen and (max-width: 768px) {
+    .vidget__progress-container {
+      top: max(16px, env(safe-area-inset-top, 16px));
+      left: 16px;
+      right: 16px;
+      height: 4px;
+    }
+  }
+`,
+
+    // Controles com glassmorphism
+    controlsCSS: `
+
+    .vidget__tap-zone {
+        z-index: 5 !important;
+        pointer-events: auto;
+    }
+
+    .vidget__video-container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      border-radius: var(--vidget-border-radius);
+      z-index: 1;
+    }
+
+    .vidget__video-container video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: inherit;
+      transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .vidget__overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: linear-gradient(
+        180deg,
+        rgba(0, 0, 0, 0.1) 0%,
+        rgba(0, 0, 0, 0) 30%,
+        rgba(0, 0, 0, 0) 70%,
+        rgba(0, 0, 0, 0.6) 100%
+      );
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .vidget__controls {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .vidget__controls > * {
+      pointer-events: auto;
+    }
+
+    /* Botões com glassmorphism */
+    .vidget__btn {
+        position: absolute;
+        border: none !important;
+        border-radius: 50% !important;
+        background: var(--vidget-bg-glass);
+        backdrop-filter: var(--vidget-backdrop-blur);
+        -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        cursor: pointer;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0;
+        will-change: transform;
+        z-index: 25; /* CORREÇÃO: Z-index muito alto */
+        pointer-events: auto; /* CORREÇÃO: Garantir que é clicável */
+    }
+
+    
+
+    .vidget__btn:active {
+      transform: scale(0.95);
+    }
+
+    .vidget__btn--close {
+      top: 26px;
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      background-image: url('${VIDGET_CONFIG.ICONS.CLOSE}');
+      background-size: 16px ;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    .vidget__btn--sound {
+      bottom: 300px; /* MUDANÇA: Som logo abaixo dos botões de navegação */
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      background-size: 26px;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    .vidget__btn--sound.sound-on {
+      background-image: url('${VIDGET_CONFIG.ICONS.SOUND}');
+    }
+
+    .vidget__btn--sound.sound-off {
+      background-image: url('${VIDGET_CONFIG.ICONS.MUTE}');
+    }
+
+    .vidget__btn--share {
+      bottom: 180px; /* MUDANÇA: Share mais embaixo */
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      background-image: url('${VIDGET_CONFIG.ICONS.SHARE}');
+      background-size: 26px;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    .vidget__btn--copy {
+      bottom: 240px; /* MUDANÇA: Copy (WhatsApp) entre som e share */
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      background-image: url('${VIDGET_CONFIG.ICONS.COPY_LINK}');
+      background-size: 22px;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    /* Navegação estilo Stories */
+    .vidget__navigation {
+      position: absolute;
+      top: 50%; /* Mudança principal: era 70px, agora 50% */
+      right: 16px;
+      transform: translateY(-50%); /* Centraliza verticalmente */
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      z-index: 25;
+    }
+
+    .vidget__nav-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: var(--vidget-bg-glass);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0;
+      z-index: 25;
+    }
+
+
+    .vidget__nav-btn--prev {
+      background-image: url('${VIDGET_CONFIG.ICONS.PREV}');
+      background-size: 22px;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    .vidget__nav-btn--next {
+      background-image: url('${VIDGET_CONFIG.ICONS.NEXT}');
+      background-size: 22px;
+      background-repeat: no-repeat;
+      background-position: center;
+    }
+
+    .vidget__btn, .vidget__nav-btn {
+    
+        filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.3));
+    }
+
+    /* Mobile adaptations */
+    @media screen and (max-width: 768px) {
+      .vidget__navigation {
+        top: 120px; /* Posição fixa no mobile */
+        right: 20px;
+        transform: none; /* Remove centralização no mobile */
+      }
+
+      .vidget__btn, .vidget__nav-btn {
+    
+        filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.5)) !important;
+    }
+
+      .vidget__nav-btn {
+        width: 52px;
+        height: 52px;
+        background-size: 24px;
+      }
+
+      .vidget__btn--sound {
+        bottom: 300px; /* Mais espaço no mobile - som abaixo da navegação */
+        right: 20px;
+        width: 52px;
+        height: 52px;
+        background-size: 26px;
+      }
+    }
+      
+    /* Artigo/Product Card */
+    .vidget__article {
+      position: absolute;
+      bottom: 16px;
+      left: 16px;
+      right: 16px; /* MUDANÇA: Largura máxima no desktop também */
+      background: var(--vidget-bg-glass);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 16px;
+      color: var(--vidget-text);
+      z-index: 5;
+      transition: var(--vidget-transition);
+    }
+
+    .vidget__article-content {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .vidget__article-image {
+      width: 60px;
+      height: 60px;
+      border-radius: 8px;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+
+    .vidget__article-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .vidget__article-title {
+      font-weight: 600;
+      font-size: 14px;
+      line-height: 1.4;
+      margin: 0 0 4px 0;
+      color: var(--vidget-text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .vidget__article-description {
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--vidget-text-secondary);
+      margin: 0 0 8px 0;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .vidget__article-price {
+      font-weight: 600;
+      font-size: 14px;
+      color: var(--vidget-success);
+      margin: 0 0 8px 0;
+    }
+
+    .vidget__article-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--vidget-primary);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: var(--vidget-transition);
+      cursor: pointer;
+    }
+
+    .vidget__article-button:hover {
+      background: var(--vidget-primary-dark) !important;
+      transform: translateY(-1px) !important;
+    }
+
+    /* Play Button */
+    .vidget__play-btn {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 64px;
+      height: 64px;
+      border-radius: 50% !important;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      display: none;
+      z-index: 15;
+    }
+
+    .vidget__play-btn::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 55%;
+      transform: translate(-50%, -50%);
+      width: 0;
+      height: 0;
+      border-style: solid;
+      border-width: 12px 0 12px 20px;
+      border-color: transparent transparent transparent #ffffff;
+    }
+
+    .vidget__play-btn:hover {
+      background: rgba(0, 0, 0, 0.8) !important;
+      border-color: rgba(255, 255, 255, 0.5) !important;
+      transform: translate(-50%, -50%) scale(1.05) !important;
+    }
+
+    /* Loading States */
+    .vidget__loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 50;
+    }
+
+    .vidget__spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid rgba(255, 255, 255, 0.3);
+      border-top: 3px solid #fff;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    /* Mobile adaptations */
+    @media screen and (max-width: 768px) {
+      .vidget__btn--close {
+        background-image: url('${VIDGET_CONFIG.ICONS.CLOSE_MOBILE}');
+        width: 44px;
+        height: 44px;
+        background-size: 24px;
+        top: max(28px, env(safe-area-inset-top, 16px));
+        right: 10px;
+      }
+
+      .vidget__video-container video, #vidget__container, #vidget__container.shadow-applied.loaded:not(.minimized), .vidget__video-container {
+         border-radius: 0 !important;
+    }
+
+      .vidget__btn--sound {
+        width: 44px;
+        height: 44px;
+        background-size: 26px;
+        right: 10px;
+        bottom: 300px; /* Ajustado para mobile - som abaixo da navegação */
+      }
+
+      .vidget__btn--sound.sound-on {
+        background-image: url('${VIDGET_CONFIG.ICONS.SOUND_MOBILE}');
+      }
+
+      .vidget__btn--sound.sound-off {
+        background-image: url('${VIDGET_CONFIG.ICONS.MUTE_MOBILE}');
+      }
+
+      .vidget__nav-btn--next {
+         top: 120px;
+         position: absolute;
+         right: 0;
+      }
+
+      .vidget__nav-btn--prev {
+         top: 180px;
+         position: absolute;
+         right: 0;
+      }
+
+      .vidget__btn--share {
+        bottom: 185px; /* Ajustado para mobile - share mais embaixo */
+        right: 10px;
+        width: 44px;
+        height: 44px;
+        background-size: 24px;
+      }
+
+      .vidget__btn--copy {
+        bottom: 240px; /* Ajustado para mobile - copy entre som e share */
+        right: 10px;
+        width: 44px;
+        height: 44px;
+        background-size: 22px;
+      }
+
+      .vidget__navigation {
+        top: 80px;
+        right: 10px;
+      }
+
+      .vidget__nav-btn {
+        width: 48px;
+        height: 48px;
+        background-size: 20px;
+      }
+
+      .vidget__article {
+        bottom: max(16px, env(safe-area-inset-bottom, 16px));
+        left: 16px;
+        right: 16px;
+        padding: 20px;
+      }
+
+      .vidget__article-content {
+        gap: 16px;
+      }
+
+      .vidget__article-image {
+        width: 80px;
+        height: 80px;
+      }
+
+      .vidget__article-title {
+        font-size: 16px;
+      }
+
+      .vidget__article-description {
+        font-size: 14px;
+      }
+
+      .vidget__article-price {
+        font-size: 16px;
+      }
+
+      .vidget__article-button {
+        padding: 12px 20px;
+        font-size: 14px;
+        border-radius: 10px;
+      }
+
+      .vidget__play-btn {
+        width: 80px;
+        height: 80px;
+      }
+
+      .vidget__play-btn::before {
+        border-width: 16px 0 16px 26px;
+      }
+    }
+
+    /* Estados minimizados */
+    #vidget__container.minimized .vidget__progress-container,
+    #vidget__container.minimized .vidget__article,
+    #vidget__container.minimized .vidget__controls > *:not(.vidget__video-container),
+    #vidget__container.minimized .vidget__play-btn {
+      display: none !important;
+    }
+
+    #vidget__container.minimized .vidget__video-container {
+       position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  overflow: hidden !important;
+      border-radius: 50%;
+    }
+
+    #vidget__container.minimized .vidget__video-container video {
+      border-radius: 50%;
+    }
+  `,
+
+    // Share popup moderno
+    sharePopupCSS: `
+    .vidget__share-popup {
+      position: absolute;
+      bottom: 16px;
+      left: 16px;
+      right: 16px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 20px;
+      padding: 24px;
+      z-index: 100;
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      color: #1a1a1a;
+    }
+
+    .vidget__share-popup.active {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    .vidget__share-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+
+    .vidget__share-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1a1a1a;
+    }
+
+    .vidget__share-close {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.1);
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: var(--vidget-transition);
+    }
+
+
+
+    .vidget__share-content {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .vidget__share-url {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      background: rgba(99, 102, 241, 0.1);
+      border: 2px solid rgba(99, 102, 241, 0.2);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: var(--vidget-transition);
+      min-width: 0;
+    }
+
+    .vidget__share-url:hover {
+      background: rgba(99, 102, 241, 0.15) !important;
+      border-color: rgba(99, 102, 241, 0.3) !important;
+    }
+
+    .vidget__share-url-text {
+      flex: 1;
+      font-size: 14px;
+      color: #1a1a1a;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .vidget__share-copy-icon {
+      width: 20px;
+      height: 20px;
+      background-image: url('${VIDGET_CONFIG.ICONS.COPY}');
+      background-size: contain;
+      background-repeat: no-repeat;
+      flex-shrink: 0;
+    }
+
+    .vidget__share-whatsapp {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px;
+      background: rgba(37, 211, 102, 0.1);
+      border: 2px solid rgba(37, 211, 102, 0.2);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: var(--vidget-transition);
+      text-decoration: none;
+      min-width: 80px;
+    }
+
+    .vidget__share-whatsapp:hover {
+      background: rgba(37, 211, 102, 0.15) !important;
+      border-color: rgba(37, 211, 102, 0.3) !important;
+      transform: translateY(-2px) !important;
+    }
+
+    .vidget__share-whatsapp-icon {
+      width: 32px;
+      height: 32px;
+      background-image: url('${VIDGET_CONFIG.ICONS.WHATSAPP}');
+      background-size: contain;
+      background-repeat: no-repeat;
+      margin-bottom: 8px;
+    }
+
+    .vidget__share-whatsapp-text {
+      font-size: 11px;
+      font-weight: 500;
+      color: #1a1a1a;
+      text-align: center;
+      line-height: 1.2;
+    }
+
+    @media screen and (max-width: 768px) {
+      .vidget__share-popup {
+        bottom: max(16px, env(safe-area-inset-bottom, 16px));
+        left: 16px;
+        right: 16px;
+        padding: 28px 24px;
+      }
+
+      .vidget__share-title {
+        font-size: 20px;
+      }
+
+      .vidget__share-content {
+        gap: 20px;
+      }
+
+      .vidget__share-url {
+        padding: 20px;
+      }
+
+      .vidget__share-url-text {
+        font-size: 16px;
+      }
+
+      .vidget__share-whatsapp {
+        padding: 20px;
+        min-width: 100px;
+      }
+
+      .vidget__share-whatsapp-icon {
+        width: 40px;
+        height: 40px;
+      }
+
+      .vidget__share-whatsapp-text {
+        font-size: 12px;
+      }
+    }
+  `,
+
+    // Toast notifications
+    toastCSS: `
+    .vidget__toast {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-100px);
+      background: rgba(0, 0, 0, 0.9);
+      backdrop-filter: var(--vidget-backdrop-blur);
+      -webkit-backdrop-filter: var(--vidget-backdrop-blur);
+      color: white;
+      padding: 12px 20px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 500;
+      z-index: 999999999;
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      pointer-events: none;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .vidget__toast.success {
+      background: rgba(16, 185, 129, 0.9);
+      border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .vidget__toast.error {
+      background: rgba(239, 68, 68, 0.9);
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .vidget__toast.active {
+      transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
+    }
+
+    @media screen and (max-width: 768px) {
+      .vidget__toast {
+        top: max(20px, env(safe-area-inset-top, 20px));
+        left: 16px;
+        right: 16px;
+        transform: translateY(-100px);
+        max-width: none;
+      }
+
+      .vidget__toast.active {
+        transform: translateY(0);
+      }
+    }
+  `,
+
+    // Inicializar todos os estilos
+    initStyles() {
+        VidgetUtils.addGoogleFonts();
+        VidgetUtils.injectCSS(this.baseCSS, 'vidget-base-styles');
+        VidgetUtils.injectCSS(this.progressBarCSS, 'vidget-progress-styles');
+        VidgetUtils.injectCSS(this.controlsCSS, 'vidget-controls-styles');
+        VidgetUtils.injectCSS(this.sharePopupCSS, 'vidget-share-styles');
+        VidgetUtils.injectCSS(this.toastCSS, 'vidget-toast-styles');
+        console.log('✅ Estilos modernos inicializados');
+    }
+};
+
+// ========================= SISTEMA DE TOAST =========================
+class ToastManager {
+    constructor() {
+        this.toasts = [];
+        this.container = null;
+    }
+
+    show(message, type = 'info', duration = 3000) {
+        const toast = this.createToast(message, type);
+        document.body.appendChild(toast);
+
+        // Animar entrada
+        requestAnimationFrame(() => {
+            toast.classList.add('active');
+        });
+
+        // Feedback haptic
+        VidgetUtils.hapticFeedback('light');
+
+        // Remover automaticamente
+        setTimeout(() => {
+            this.remove(toast);
+        }, duration);
+
+        return toast;
+    }
+
+    createToast(message, type) {
+        const toast = document.createElement('div');
+        toast.className = `vidget__toast ${type}`;
+        toast.textContent = message;
+
+        // Adicionar ao array de controle
+        this.toasts.push(toast);
+
+        return toast;
+    }
+
+    remove(toast) {
+        if (!toast.parentNode) return;
+
+        toast.classList.remove('active');
+
+        setTimeout(() => {
+            if (toast.parentNode) {
+                toast.parentNode.removeChild(toast);
+            }
+
+            const index = this.toasts.indexOf(toast);
+            if (index > -1) {
+                this.toasts.splice(index, 1);
+            }
+        }, 400);
+    }
+
+    clear() {
+        this.toasts.forEach(toast => this.remove(toast));
+    }
+}
+
+// ========================= GERENCIADOR DE VÍDEOS =========================
+class VideoManager {
+    constructor() {
+        this.currentVideo = null;
+        this.isLoading = false;
+        this.preloadedVideos = new Map();
+    }
+
+    async loadVideo(videoData, container, index, retryCount = 0) {
+        const MAX_RETRIES = globalState.isSafari ? 2 : 0; // Retry só no Safari!
+
+        try {
+            this.isLoading = true;
+            const videoElement = container.querySelector('video') || this.createVideoElement();
+            this.currentVideo = videoElement;
+
+            this.setupVideoElement(videoElement);
+
+            const videoUrl = `${VIDGET_CONFIG.STORAGE_URL}/${videoData.url}`;
+
+            if (this.preloadedVideos.has(videoUrl)) {
+                const preloadedVideo = this.preloadedVideos.get(videoUrl);
+                this.copyVideoState(preloadedVideo, videoElement);
+            } else {
+                videoElement.src = videoUrl;
+            }
+
+            if (!videoElement.parentNode) {
+                container.appendChild(videoElement);
+            }
+
+            await this.waitForVideoLoad(videoElement);
+            this.setupVideoEvents(videoElement, videoData, index);
+            ProgressBarManager.initialize(videoElement, index);
+
+            this.isLoading = false;
+            return videoElement;
+
+        } catch (error) {
+            this.isLoading = false;
+
+            // 🎯 RETRY APENAS NO SAFARI E APENAS SE TIMEOUT
+            if (retryCount < MAX_RETRIES && error.message.includes('Timeout')) {
+                console.log(`🔄 Safari retry ${retryCount + 1}/${MAX_RETRIES}`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+                return this.loadVideo(videoData, container, index, retryCount + 1);
+            }
+
+            throw error;
+        }
+    }
+
+    createVideoElement() {
+        const video = document.createElement('video');
+        this.setupVideoElement(video);
+        return video;
+    }
+
+    setupVideoElement(video) {
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.setAttribute('webkit-playsinline', '');
+        video.setAttribute('x-webkit-airplay', 'allow');
+
+        // 🎯 ESTRATÉGIA INTELIGENTE: metadata primeiro, auto só se necessário
+        video.setAttribute('preload', 'metadata');
+
+        video.autoplay = true;
+        video.loop = false;
+        video.controls = false;
+
+        // Safari precisa de carga completa? Fazer sob demanda
+        if (globalState.isSafari) {
+            video.addEventListener('loadedmetadata', () => {
+                // Se Safari não tem dados suficientes, forçar auto
+                if (video.readyState < 3) {
+                    video.setAttribute('preload', 'auto');
+                    video.load();
+                }
+            }, { once: true });
+        }
+
+        if (globalState.isIOS) {
+            video.load();
+        }
+    }
+
+    copyVideoState(source, target) {
+        target.src = source.src;
+        target.currentTime = source.currentTime;
+        if (!source.paused) {
+            target.play().catch(console.warn);
+        }
+    }
+
+    waitForVideoLoad(video) {
+        return new Promise((resolve, reject) => {
+            // 🎯 ESTRATÉGIA: Aceitar 2 OU 3 dependendo do navegador
+            const minReadyState = globalState.isSafari ? 3 : 2;
+
+            if (video.readyState >= minReadyState) {
+                resolve();
+                return;
+            }
+
+            const onLoad = () => {
+                if (video.readyState >= minReadyState) {
+                    cleanup();
+                    resolve();
+                }
+            };
+
+            const onError = () => {
+                cleanup();
+                console.error('Erro ao carregar:', video.error);
+                reject(new Error('Falha ao carregar vídeo'));
+            };
+
+            const cleanup = () => {
+                video.removeEventListener('canplay', onLoad);
+                video.removeEventListener('canplaythrough', onLoad);
+                video.removeEventListener('error', onError);
+            };
+
+            // Múltiplos eventos para cobrir todos os casos
+            video.addEventListener('canplay', onLoad);        // readyState >= 3
+            video.addEventListener('canplaythrough', onLoad); // readyState >= 4
+            video.addEventListener('error', onError);
+
+            setTimeout(() => {
+                cleanup();
+                reject(new Error('Timeout ao carregar vídeo'));
+            }, 15000); // Aumentar timeout
+        });
+    }
+
+    setupVideoEvents(video, videoData, index) {
+        // Play event
+        video.addEventListener('play', () => {
+            globalState.sessionManager.trackEvent('video_start', {
+                videoId: videoData.id,
+                videoIndex: index,
+                timestamp: Date.now()
+            });
+            globalState.lastTimeUpdate = video.currentTime;
+        });
+
+        // Timeupdate para métricas
+        const timeUpdateHandler = VidgetUtils.throttle(() => {
+            const currentTime = video.currentTime;
+            const duration = video.duration;
+            const completionPercentage = (currentTime / duration) * 100;
+
+            if (currentTime - globalState.lastTimeUpdate >= VIDGET_CONFIG.METRICS_UPDATE_INTERVAL) {
+                const timeWatched = currentTime - globalState.lastTimeUpdate;
+
+                globalState.sessionManager.trackEvent('watch_time', {
+                    videoId: videoData.id,
+                    videoIndex: index,
+                    timeWatched,
+                    completionPercentage,
+                    timestamp: Date.now()
+                });
+
+                globalState.lastTimeUpdate = currentTime;
+            }
+        }, 1000);
+
+        video.addEventListener('timeupdate', timeUpdateHandler);
+
+        // Pause event
+        video.addEventListener('pause', () => {
+            if (globalState.lastTimeUpdate < video.currentTime) {
+                const timeWatched = video.currentTime - globalState.lastTimeUpdate;
+                globalState.sessionManager.trackEvent('watch_time', {
+                    videoId: videoData.id,
+                    videoIndex: index,
+                    timeWatched,
+                    completionPercentage: (video.currentTime / video.duration) * 100,
+                    timestamp: Date.now()
+                });
+                globalState.lastTimeUpdate = video.currentTime;
+            }
+        });
+
+        // CORREÇÃO: Ended event com auto-advance
+        video.addEventListener('ended', () => {
+            globalState.sessionManager.trackEvent('video_complete', {
+                videoId: videoData.id,
+                videoIndex: index,
+                timestamp: Date.now()
+            });
+
+            // Auto-advance imediato como Stories
+            if (index < globalState.videoSet.length - 1) {
+                // Há próximo vídeo
+                VideoTransitions.changeVideo(1);
+            } else {
+                // É o último vídeo - voltar ao primeiro ou minimizar
+                if (globalState.videoSet.length > 1) {
+                    // Resetar todas as barras e voltar ao primeiro
+                    ProgressBarManager.resetAllProgress();
+                    VideoTransitions.changeVideo(-index); // Volta para o primeiro
+                } else {
+                    // Só tem um vídeo - reiniciar
+                    video.currentTime = 0;
+                    video.play();
+                    ProgressBarManager.initialize(video, index);
+                }
+            }
+        });
+
+        // Click para pause/play
+        video.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (!globalState.vidgetContainer.classList.contains('minimized')) {
+                if (video.paused) {
+                    video.play();
+                    PlayButtonManager.hide();
+                } else {
+                    video.pause();
+                    PlayButtonManager.show();
+                }
+            }
+        });
+    }
+
+    async preloadAdjacent(currentIndex) {
+        const preloadPromises = [];
+
+        for (let i = 1; i <= VIDGET_CONFIG.PRELOAD_ADJACENT_COUNT; i++) {
+            // Próximos vídeos
+            const nextIndex = (currentIndex + i) % globalState.videoSet.length;
+            if (nextIndex !== currentIndex) {
+                preloadPromises.push(this.preloadSingle(globalState.videoSet[nextIndex]));
+            }
+
+            // Vídeos anteriores
+            const prevIndex = (currentIndex - i + globalState.videoSet.length) % globalState.videoSet.length;
+            if (prevIndex !== currentIndex && prevIndex !== nextIndex) {
+                preloadPromises.push(this.preloadSingle(globalState.videoSet[prevIndex]));
+            }
+        }
+
+        try {
+            await Promise.allSettled(preloadPromises);
+            console.log('✅ Vídeos adjacentes pré-carregados');
+        } catch (error) {
+            console.warn('Erro no pré-carregamento:', error);
+        }
+    }
+
+    async preloadSingle(videoData) {
+        const videoUrl = `${VIDGET_CONFIG.STORAGE_URL}/${videoData.url}`;
+
+        if (this.preloadedVideos.has(videoUrl)) {
+            return;
+        }
+
+        try {
+            const video = await VidgetUtils.preloadVideo(videoUrl);
+            this.preloadedVideos.set(videoUrl, video);
+        } catch (error) {
+            console.warn(`Falha ao pré-carregar vídeo ${videoData.id}:`, error);
+        }
+    }
+
+    cleanup() {
+        // Limpar vídeos pré-carregados
+        this.preloadedVideos.forEach(video => {
+            video.src = '';
+            video.load();
+        });
+        this.preloadedVideos.clear();
+
+        // Limpar vídeo atual
+        if (this.currentVideo) {
+            this.currentVideo.pause();
+            this.currentVideo.src = '';
+            this.currentVideo.load();
+        }
+    }
+}
+
+// ========================= GERENCIADOR DE PROGRESSO =========================
+class ProgressBarManager {
+    static initialize(videoElement, currentIndex) {
+        const progressBars = document.querySelectorAll('.vidget__progress-bar');
+
+        // Criar elementos .progress-fill se não existirem
+        progressBars.forEach((bar, index) => {
+            if (!bar.querySelector('.progress-fill')) {
+                const fill = document.createElement('div');
+                fill.className = 'progress-fill';
+                bar.appendChild(fill);
+            }
+        });
+
+        // Reset todas as barras baseado no índice atual
+        progressBars.forEach((bar, index) => {
+            const fill = bar.querySelector('.progress-fill');
+            if (!fill) return;
+
+            if (index < currentIndex) {
+                // Vídeos anteriores = completos
+                bar.classList.add('completed');
+                bar.classList.remove('active');
+                fill.style.width = '100%';
+            } else if (index > currentIndex) {
+                // Vídeos futuros = zerados
+                bar.classList.remove('completed', 'active');
+                fill.style.width = '0%';
+            } else {
+                // Vídeo atual = ativo e zerado
+                bar.classList.add('active');
+                bar.classList.remove('completed');
+                fill.style.width = '0%';
+            }
+        });
+
+        // Limpar interval anterior
+        if (globalState.progressInterval) {
+            clearInterval(globalState.progressInterval);
+        }
+
+        // Configurar novo interval para atualização contínua
+        if (videoElement) {
+            // Atualização inicial
+            this.updateProgress(videoElement, currentIndex);
+
+            // Atualizar a cada frame para suavidade
+            globalState.progressInterval = setInterval(() => {
+                this.updateProgress(videoElement, currentIndex);
+            }, 16); // ~60fps
+        }
+    }
+
+    static updateProgress(videoElement, currentIndex) {
+        if (!videoElement || videoElement.duration === 0) return;
+
+        const progressBar = document.querySelectorAll('.vidget__progress-bar')[currentIndex];
+        if (!progressBar) return;
+
+        const fill = progressBar.querySelector('.progress-fill');
+        if (!fill) return;
+
+        const percent = (videoElement.currentTime / videoElement.duration) * 100;
+        fill.style.width = `${percent}%`;
+
+        // Se chegou ao fim, marcar como completo
+        if (percent >= 99.5) {
+            this.completeProgress(currentIndex);
+        }
+    }
+
+    static completeProgress(index) {
+        const progressBar = document.querySelectorAll('.vidget__progress-bar')[index];
+        if (progressBar) {
+            const fill = progressBar.querySelector('.progress-fill');
+            if (fill) {
+                progressBar.classList.add('completed');
+                progressBar.classList.remove('active');
+                fill.style.width = '100%';
+            }
+        }
+    }
+
+    static resetProgress(index) {
+        const progressBar = document.querySelectorAll('.vidget__progress-bar')[index];
+        if (progressBar) {
+            const fill = progressBar.querySelector('.progress-fill');
+            if (fill) {
+                progressBar.classList.remove('completed', 'active');
+                fill.style.width = '0%';
+            }
+        }
+    }
+
+    static resetAllProgress() {
+        const progressBars = document.querySelectorAll('.vidget__progress-bar');
+        progressBars.forEach((bar, index) => {
+            const fill = bar.querySelector('.progress-fill');
+            if (fill) {
+                bar.classList.remove('completed', 'active');
+                fill.style.width = '0%';
+            }
+        });
+    }
+
+    static cleanup() {
+        if (globalState.progressInterval) {
+            clearInterval(globalState.progressInterval);
+            globalState.progressInterval = null;
+        }
+    }
+}
+
+
+// ========================= TRANSIÇÕES DE VÍDEO =========================
+class VideoTransitions {
+    static async changeVideo(direction) {
+        if (globalState.isChangingVideo) return;
+        globalState.isChangingVideo = true;
+
+        try {
+            const oldIndex = globalState.currentVideoIndex;
+            const newIndex = (oldIndex + direction + globalState.videoSet.length) % globalState.videoSet.length;
+            const videoContainer = globalState.vidgetContainer.querySelector('.vidget__video-container');
+
+            // Salvar métricas do vídeo atual
+            if (globalState.currentVideoElement) {
+                this.saveCurrentMetrics();
+            }
+
+            // Pausar vídeo atual
+            if (globalState.currentVideoElement) {
+                globalState.currentVideoElement.pause();
+            }
+
+            // Atualizar barras de progresso ANTES da transição
+            if (direction > 0) {
+                // Indo para frente - completar barra atual
+                ProgressBarManager.completeProgress(oldIndex);
+            } else if (direction < 0 && oldIndex > 0) {
+                // Voltando - resetar barra atual e a anterior
+                ProgressBarManager.resetProgress(oldIndex);
+                if (newIndex < oldIndex) {
+                    ProgressBarManager.resetProgress(newIndex);
+                }
+            }
+
+            // Criar novo vídeo
+            const newVideoElement = document.createElement('video');
+
+            // Configurações essenciais
+            newVideoElement.setAttribute('playsinline', '');
+            newVideoElement.setAttribute('webkit-playsinline', '');
+            newVideoElement.setAttribute('x-webkit-airplay', 'allow');
+            newVideoElement.setAttribute('preload', 'auto');
+            newVideoElement.setAttribute('muted', '');
+
+            newVideoElement.autoplay = true;
+            newVideoElement.muted = globalState.currentVideoElement ? globalState.currentVideoElement.muted : true;
+            newVideoElement.loop = false; // IMPORTANTE: Não loopar para funcionar como Stories
+            newVideoElement.controls = false;
+
+            // Configurar source
+            const videoUrl = `${VIDGET_CONFIG.STORAGE_URL}/${globalState.videoSet[newIndex].url}`;
+            newVideoElement.src = videoUrl;
+            newVideoElement.load();
+
+            // Configurar eventos
+            globalState.videoManager.setupVideoEvents(newVideoElement, globalState.videoSet[newIndex], newIndex);
+
+            // Executar transição
+            await this.executeTransition(videoContainer, newVideoElement, direction);
+
+            // Atualizar estado
+            globalState.currentVideoIndex = newIndex;
+            globalState.currentVideoElement = newVideoElement;
+            globalState.lastTimeUpdate = 0;
+
+            // Inicializar barra de progresso do novo vídeo
+            ProgressBarManager.initialize(newVideoElement, newIndex);
+
+            // Atualizar UI
+            this.updateUI(newIndex);
+
+            // Pré-carregar vídeos adjacentes
+            globalState.videoManager.preloadAdjacent(newIndex);
+
+            // Feedback haptic
+            VidgetUtils.hapticFeedback('medium');
+
+        } catch (error) {
+            console.error('Erro na transição de vídeo:', error);
+            if (globalState.currentVideoElement) {
+                globalState.currentVideoElement.play().catch(console.warn);
+            }
+        } finally {
+            globalState.isChangingVideo = false;
+        }
+    }
+
+    static async executeTransition(container, newVideo, direction) {
+        const currentVideo = container.querySelector('video');
+
+        if (!currentVideo) {
+            container.appendChild(newVideo);
+            await new Promise((resolve) => {
+                if (newVideo.readyState >= 2) {
+                    resolve();
+                } else {
+                    newVideo.addEventListener('loadeddata', resolve, { once: true });
+                }
+            });
+            return;
+        }
+
+        // Configurar novo vídeo
+        newVideo.style.position = 'absolute';
+        newVideo.style.top = '0';
+        newVideo.style.left = '0';
+        newVideo.style.width = '100%';
+        newVideo.style.height = '100%';
+        newVideo.style.zIndex = '1';
+        newVideo.style.opacity = '0';
+        newVideo.style.transition = 'opacity 0.3s ease-in-out';
+
+        container.appendChild(newVideo);
+
+        // Aguardar carregamento
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Timeout loading video'));
+            }, 5000);
+
+            if (newVideo.readyState >= 2) {
+                clearTimeout(timeout);
+                resolve();
+            } else {
+                newVideo.addEventListener('loadeddata', () => {
+                    clearTimeout(timeout);
+                    resolve();
+                }, { once: true });
+
+                newVideo.addEventListener('error', () => {
+                    clearTimeout(timeout);
+                    reject(new Error('Video load error'));
+                }, { once: true });
+            }
+        });
+
+        // Reproduzir novo vídeo
+        try {
+            await newVideo.play();
+        } catch (error) {
+            console.warn('Autoplay falhou:', error);
+        }
+
+        // Transição suave
+        await new Promise(resolve => {
+            requestAnimationFrame(() => {
+                newVideo.style.opacity = '1';
+                if (currentVideo) {
+                    currentVideo.style.opacity = '0';
+                }
+                setTimeout(resolve, 300);
+            });
+        });
+
+        // Limpar vídeo anterior
+        if (currentVideo && currentVideo.parentNode) {
+            currentVideo.pause();
+            currentVideo.src = '';
+            currentVideo.load();
+            currentVideo.remove();
+        }
+
+        // Resetar estilos
+        newVideo.style.position = '';
+        newVideo.style.top = '';
+        newVideo.style.left = '';
+        newVideo.style.zIndex = '';
+        newVideo.style.opacity = '';
+        newVideo.style.transition = '';
+    }
+
+    static saveCurrentMetrics() {
+        if (globalState.lastTimeUpdate < globalState.currentVideoElement.currentTime) {
+            const timeWatched = globalState.currentVideoElement.currentTime - globalState.lastTimeUpdate;
+            const completionPercentage = (globalState.currentVideoElement.currentTime / globalState.currentVideoElement.duration) * 100;
+
+            globalState.sessionManager.trackEvent('watch_time', {
+                videoId: globalState.videoSet[globalState.currentVideoIndex].id,
+                videoIndex: globalState.currentVideoIndex,
+                timeWatched,
+                completionPercentage,
+                timestamp: Date.now()
+            });
+        }
+    }
+
+    static updateUI(newIndex) {
+        SoundManager.updateIcons(globalState.currentVideoElement?.muted || true);
+        ArticleManager.update(globalState.videoSet[newIndex]);
+        NavigationManager.updateButtons(newIndex);
+
+        if (globalState.currentVideoElement && !globalState.currentVideoElement.paused) {
+            PlayButtonManager.hide();
+        }
+    }
+
+    static saveCurrentMetrics() {
+        if (globalState.lastTimeUpdate < globalState.currentVideoElement.currentTime) {
+            const timeWatched = globalState.currentVideoElement.currentTime - globalState.lastTimeUpdate;
+            const completionPercentage = (globalState.currentVideoElement.currentTime / globalState.currentVideoElement.duration) * 100;
+
+            globalState.sessionManager.trackEvent('watch_time', {
+                videoId: globalState.videoSet[globalState.currentVideoIndex].id,
+                videoIndex: globalState.currentVideoIndex,
+                timeWatched,
+                completionPercentage,
+                timestamp: Date.now()
+            });
+        }
+    }
+
+}
+
+// ========================= GERENCIADOR DE SOM =========================
+class SoundManager {
+    static toggle() {
+        if (!globalState.currentVideoElement) return;
+
+        const wasMuted = globalState.currentVideoElement.muted;
+        globalState.currentVideoElement.muted = !wasMuted;
+
+        this.updateIcons(!wasMuted);
+
+        // Feedback haptic
+        VidgetUtils.hapticFeedback('light');
+
+        // Toast feedback
+        globalState.toastManager.show(
+            wasMuted ? '🔊 Som ligado' : '🔇 Som desligado',
+            'info',
+            1500
+        );
+    }
+
+    static updateIcons(isMuted) {
+        const soundBtn = document.querySelector('.vidget__btn--sound');
+        if (!soundBtn) return;
+
+        soundBtn.classList.remove('sound-on', 'sound-off');
+        soundBtn.classList.add(isMuted ? 'sound-off' : 'sound-on');
+    }
+}
+
+// ========================= GERENCIADOR DE BOTÃO PLAY =========================
+class PlayButtonManager {
+    static show() {
+        let playBtn = document.querySelector('.vidget__play-btn');
+        if (!playBtn) {
+            playBtn = this.create();
+        }
+
+        playBtn.style.display = 'flex';
+        VidgetUtils.animateElement(playBtn, [
+            { opacity: 0, transform: 'translate(-50%, -50%) scale(0.8)' },
+            { opacity: 1, transform: 'translate(-50%, -50%) scale(1)' }
+        ], { duration: 200 });
+    }
+
+    static hide() {
+        const playBtn = document.querySelector('.vidget__play-btn');
+        if (playBtn) {
+            VidgetUtils.animateElement(playBtn, [
+                { opacity: 1, transform: 'translate(-50%, -50%) scale(1)' },
+                { opacity: 0, transform: 'translate(-50%, -50%) scale(0.8)' }
+            ], { duration: 200 }).then(() => {
+                playBtn.style.display = 'none';
+            });
+        }
+    }
+
+    static create() {
+        const playBtn = document.createElement('button');
+        playBtn.className = 'vidget__play-btn';
+        playBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (globalState.currentVideoElement) {
+                globalState.currentVideoElement.play();
+                this.hide();
+            }
+        });
+
+        const container = globalState.vidgetContainer.querySelector('.vidget__video-container');
+        container.appendChild(playBtn);
+
+        return playBtn;
+    }
+}
+
+// ========================= GERENCIADOR DE ARTIGO =========================
+class ArticleManager {
+    static async incrementClicks(supabaseInstance, videoId, videoIndex) {
+        try {
+            const { data, error: fetchError } = await supabaseInstance
+                .from('vidget::videos')
+                .select('metadata')
+                .eq('id', videoId)
+                .single();
+
+            if (fetchError) throw fetchError;
+
+            const currentVideoId = `video_${videoIndex}`;
+            if (!data.metadata.metrics?.[currentVideoId]) {
+                data.metadata.metrics = {
+                    ...data.metadata.metrics,
+                    [currentVideoId]: {
+                        duration: globalState.currentVideoElement?.duration || 0,
+                        totalViews: 0,
+                        totalClicks: 0,
+                        totalWatchTime: 0,
+                        averageWatchTime: 0,
+                        dailyMetrics: {},
+                        completionRates: {
+                            "0-25": 0,
+                            "26-50": 0,
+                            "51-75": 0,
+                            "76-100": 0
+                        }
+                    }
+                };
+            }
+
+            const currentDate = new Date().toISOString().split('T')[0];
+            const metrics = data.metadata.metrics[currentVideoId];
+
+            metrics.totalClicks++;
+
+            if (!metrics.dailyMetrics[currentDate]) {
+                metrics.dailyMetrics[currentDate] = {
+                    views: 0,
+                    clicks: 0,
+                    watchTime: 0,
+                    sessions: 0
+                };
+            }
+
+            metrics.dailyMetrics[currentDate].clicks++;
+
+            const { error: updateError } = await supabaseInstance
+                .from('vidget::videos')
+                .update({ metadata: data.metadata })
+                .eq('id', videoId);
+
+            if (updateError) throw updateError;
+        } catch (error) {
+            console.error('Erro ao incrementar cliques (ArticleManager):', error);
+        }
+    }
+
+    static update(videoData) {
+        const article = document.querySelector('.vidget__article');
+        if (!article) return;
+
+        const metadata = videoData.metadata || {};
+        const isNewFormat = 'showTitle' in metadata || 'showDescription' in metadata;
+
+        // Extrair dados
+        const title = isNewFormat ? (metadata.showTitle ? metadata.title : '') : metadata.title;
+        const description = isNewFormat ? (metadata.showDescription ? metadata.description : '') : metadata.description;
+        const price = isNewFormat ? (metadata.showPrice ? (metadata.price || metadata.productPrice) : '') : metadata.productPrice;
+        const buttonUrl = isNewFormat ? (metadata.showButton ? metadata.buttonUrl : '') : metadata.productUrl;
+        const buttonText = isNewFormat ? (metadata.showButton ? metadata.buttonText || 'Ver produto' : '') : 'Ver produto';
+        const imageUrl = videoData.image_url_from_set || metadata.image_url;
+        const showImage = isNewFormat ? metadata.showThumbnail : !!imageUrl;
+
+        // Atualizar conteúdo
+        this.updateElement('.vidget__article-title', title);
+        this.updateElement('.vidget__article-description', VidgetUtils.convertTextToLinks(description));
+        this.updateElement('.vidget__article-price', price ? `R$ ${price}` : '');
+
+        // Atualizar imagem
+        const img = article.querySelector('.vidget__article-image');
+        if (img && showImage && imageUrl) {
+            img.src = imageUrl;
+            img.style.display = '';
+        } else if (img) {
+            img.style.display = 'none';
+        }
+
+        // Atualizar botão
+        const button = article.querySelector('.vidget__article-button');
+        if (button && buttonUrl) {
+            button.href = buttonUrl;
+            button.textContent = buttonText;
+            button.style.display = '';
+
+            // SUBSTITUIR: Adicionar evento de clique para métricas
+            button.onclick = async () => {
+                globalState.sessionManager.trackEvent('click', {
+                    videoId: videoData.id,
+                    videoIndex: globalState.currentVideoIndex,
+                    buttonUrl,
+                    timestamp: Date.now()
+                });
+
+                // ADICIONAR: Incrementar cliques no banco
+                await this.incrementClicks(
+                    globalState.supabaseInstance,
+                    videoData.id,
+                    globalState.currentVideoIndex + 1
+                );
+            };
+        } else if (button) {
+            button.style.display = 'none';
+        }
+    }
+
+    static updateElement(selector, content) {
+        const element = document.querySelector(selector);
+        if (!element) return;
+
+        if (content) {
+            element.innerHTML = content;
+            element.style.display = '';
+        } else {
+            element.style.display = 'none';
+        }
+    }
+}
+
+// ========================= GERENCIADOR DE NAVEGAÇÃO =========================
+class NavigationManager {
+    static setupEventListeners() {
+        // Botão anterior
+        const prevBtn = document.querySelector('.vidget__nav-btn--prev');
+        if (prevBtn) {
+            prevBtn.addEventListener('click', (e) => {
+                console.log('Prev button clicked');
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                VideoTransitions.changeVideo(-1);
+                VidgetUtils.hapticFeedback('light');
+            }, { capture: true });
+        }
+
+        // Botão próximo
+        const nextBtn = document.querySelector('.vidget__nav-btn--next');
+        if (nextBtn) {
+            nextBtn.addEventListener('click', (e) => {
+                console.log('Next button clicked');
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                VideoTransitions.changeVideo(1);
+                VidgetUtils.hapticFeedback('light');
+            }, { capture: true });
+        }
+
+        // CORREÇÃO: Configurar tap zones de forma mais específica
+        this.setupStoryTapZones();
+
+        // Event listeners para teclado
+        document.addEventListener('keydown', (e) => {
+            if (globalState.vidgetContainer?.classList.contains('minimized')) return;
+            if (!globalState.vidgetContainer?.classList.contains('loaded')) return;
+
+            switch (e.key) {
+                case 'ArrowUp':
+                    e.preventDefault();
+                    VideoTransitions.changeVideo(-1);
+                    break;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    VideoTransitions.changeVideo(1);
+                    break;
+                case ' ':
+                case 'Spacebar':
+                    e.preventDefault();
+                    if (globalState.currentVideoElement) {
+                        if (globalState.currentVideoElement.paused) {
+                            globalState.currentVideoElement.play();
+                            PlayButtonManager.hide();
+                        } else {
+                            globalState.currentVideoElement.pause();
+                            PlayButtonManager.show();
+                        }
+                    }
+                    break;
+                case 'Escape':
+                    e.preventDefault();
+                    WidgetStateManager.minimize();
+                    break;
+            }
+        });
+    }
+
+    static setupStoryTapZones() {
+        const container = globalState.vidgetContainer;
+        const videoContainer = container.querySelector('.vidget__video-container');
+
+        // CORREÇÃO: Remover tap zones antigas se existirem
+        const oldLeftZone = videoContainer.querySelector('.vidget__tap-zone--left');
+        const oldRightZone = videoContainer.querySelector('.vidget__tap-zone--right');
+        if (oldLeftZone) oldLeftZone.remove();
+        if (oldRightZone) oldRightZone.remove();
+
+        // Criar zonas de toque invisíveis
+        const leftZone = document.createElement('div');
+        leftZone.className = 'vidget__tap-zone vidget__tap-zone--left';
+        leftZone.style.cssText = `
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 25%; /* CORREÇÃO: Reduzir para 25% */
+            height: 100%;
+            z-index: 5; /* CORREÇÃO: z-index mais baixo que os botões */
+            cursor: pointer;
+            pointer-events: auto;
+        `;
+
+        const rightZone = document.createElement('div');
+        rightZone.className = 'vidget__tap-zone vidget__tap-zone--right';
+        rightZone.style.cssText = `
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 25%; /* CORREÇÃO: Reduzir para 25% */
+            height: 100%;
+            z-index: 5; /* CORREÇÃO: z-index mais baixo que os botões */
+            cursor: pointer;
+            pointer-events: auto;
+        `;
+
+        // CORREÇÃO: Eventos com verificação mais específica
+        leftZone.addEventListener('click', (e) => {
+            console.log('Left tap zone clicked');
+
+            // Verificar se clicou em botão dentro da zona
+            if (GestureManager.shouldIgnoreTouch(e.target)) {
+                console.log('Ignorando - clicou em botão dentro da zona');
+                return;
+            }
+
+            e.stopPropagation();
+            e.preventDefault();
+
+            if (!globalState.vidgetContainer.classList.contains('minimized')) {
+                console.log('Navegando para vídeo anterior via tap zone');
+                VideoTransitions.changeVideo(-1);
+            }
+        });
+
+        rightZone.addEventListener('click', (e) => {
+            console.log('Right tap zone clicked');
+
+            // Verificar se clicou em botão dentro da zona
+            if (GestureManager.shouldIgnoreTouch(e.target)) {
+                console.log('Ignorando - clicou em botão dentro da zona');
+                return;
+            }
+
+            e.stopPropagation();
+            e.preventDefault();
+
+            if (!globalState.vidgetContainer.classList.contains('minimized')) {
+                console.log('Navegando para próximo vídeo via tap zone');
+                VideoTransitions.changeVideo(1);
+            }
+        });
+
+        // Adicionar ao container
+        videoContainer.appendChild(leftZone);
+        videoContainer.appendChild(rightZone);
+    }
+}
+
+
+// ========================= GERENCIADOR DE COMPARTILHAMENTO =========================
+class ShareManager {
+
+    static async incrementClicks(supabaseInstance, videoId, videoIndex) {
+        try {
+            const { data, error: fetchError } = await supabaseInstance
+                .from('vidget::videos')
+                .select('metadata')
+                .eq('id', videoId)
+                .single();
+
+            if (fetchError) throw fetchError;
+
+            const currentVideoId = `video_${videoIndex}`;
+            if (!data.metadata.metrics?.[currentVideoId]) {
+                data.metadata.metrics = {
+                    ...data.metadata.metrics,
+                    [currentVideoId]: {
+                        duration: globalState.currentVideoElement?.duration || 0,
+                        totalViews: 0,
+                        totalClicks: 0,
+                        totalWatchTime: 0,
+                        averageWatchTime: 0,
+                        dailyMetrics: {},
+                        completionRates: {
+                            "0-25": 0,
+                            "26-50": 0,
+                            "51-75": 0,
+                            "76-100": 0
+                        }
+                    }
+                };
+            }
+
+            const currentDate = new Date().toISOString().split('T')[0];
+            const metrics = data.metadata.metrics[currentVideoId];
+
+            metrics.totalClicks++;
+
+            if (!metrics.dailyMetrics[currentDate]) {
+                metrics.dailyMetrics[currentDate] = {
+                    views: 0,
+                    clicks: 0,
+                    watchTime: 0,
+                    sessions: 0
+                };
+            }
+
+            metrics.dailyMetrics[currentDate].clicks++;
+
+            const { error: updateError } = await supabaseInstance
+                .from('vidget::videos')
+                .update({ metadata: data.metadata })
+                .eq('id', videoId);
+
+            if (updateError) throw updateError;
+        } catch (error) {
+            console.error('Erro ao incrementar cliques (ShareManager):', error);
+        }
+    }
+
+    static toggle() {
+        const existingPopup = document.querySelector('.vidget__share-popup');
+
+        if (existingPopup) {
+            this.hide();
+            return;
+        }
+
+        this.show();
+    }
+
+    static show() {
+        const popup = this.createPopup();
+        const container = globalState.vidgetContainer.querySelector('.vidget__video-container');
+        container.appendChild(popup);
+
+        // Esconder artigo temporariamente
+        const article = document.querySelector('.vidget__article');
+        if (article) {
+            article.style.display = 'none';
+        }
+
+        // Animar entrada
+        requestAnimationFrame(() => {
+            popup.classList.add('active');
+        });
+
+        // Feedback haptic
+        VidgetUtils.hapticFeedback('medium');
+    }
+
+    static hide() {
+        const popup = document.querySelector('.vidget__share-popup');
+        if (!popup) return;
+
+        popup.classList.remove('active');
+
+        setTimeout(() => {
+            if (popup.parentNode) {
+                popup.parentNode.removeChild(popup);
+            }
+
+            // Mostrar artigo novamente
+            const article = document.querySelector('.vidget__article');
+            if (article && !globalState.vidgetContainer.classList.contains('minimized')) {
+                article.style.display = '';
+            }
+        }, 400);
+    }
+
+    static createPopup() {
+        const currentUrl = window.location.href;
+        const metadata = globalState.videoSet[globalState.currentVideoIndex].metadata || {};
+        const whatsappNumber = metadata.numberWhats || '';
+        const whatsappMessage = metadata.msgDataWhats || 'Confira este produto!';
+
+        const popup = document.createElement('div');
+        popup.className = 'vidget__share-popup';
+        popup.innerHTML = `
+      <div class="vidget__share-header">
+        <div class="vidget__share-title">Compartilhar</div>
+        <button class="vidget__share-close" onclick="ShareManager.hide()">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M12 4L4 12M4 4L12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="vidget__share-content">
+        <div class="vidget__share-url" onclick="ShareManager.copyLink()">
+          <div class="vidget__share-url-text">${currentUrl}</div>
+          <div class="vidget__share-copy-icon"></div>
+        </div>
+        ${whatsappNumber ? `
+          <a href="${this.generateWhatsAppUrl(whatsappNumber, whatsappMessage, currentUrl)}" 
+             target="_blank" 
+             class="vidget__share-whatsapp"
+             onclick="ShareManager.trackWhatsAppShare()">
+            <div class="vidget__share-whatsapp-icon"></div>
+            <div class="vidget__share-whatsapp-text">Enviar no WhatsApp</div>
+          </a>
+        ` : ''}
+      </div>
+    `;
+
+        return popup;
+    }
+
+    static copyLink() {
+        const currentUrl = window.location.href;
+
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(currentUrl).then(() => {
+                globalState.toastManager.show('📋 Link copiado!', 'success');
+                this.hide();
+            }).catch(() => {
+                this.fallbackCopyLink(currentUrl);
+            });
+        } else {
+            this.fallbackCopyLink(currentUrl);
+        }
+
+        // Track evento
+        globalState.sessionManager.trackEvent('share', {
+            videoId: globalState.videoSet[globalState.currentVideoIndex].id,
+            videoIndex: globalState.currentVideoIndex,
+            shareType: 'copy_link',
+            timestamp: Date.now()
+        });
+
+        // ADICIONAR: Incrementar cliques no banco
+        this.incrementClicks(
+            globalState.supabaseInstance,
+            globalState.videoSet[globalState.currentVideoIndex].id,
+            globalState.currentVideoIndex + 1
+        );
+
+        VidgetUtils.hapticFeedback('light');
+    }
+
+    static fallbackCopyLink(url) {
+        const textArea = document.createElement('textarea');
+        textArea.value = url;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+
+        try {
+            document.execCommand('copy');
+            globalState.toastManager.show('📋 Link copiado!', 'success');
+            this.hide();
+        } catch (err) {
+            globalState.toastManager.show('❌ Erro ao copiar link', 'error');
+        }
+
+        document.body.removeChild(textArea);
+    }
+
+    static generateWhatsAppUrl(number, message, url) {
+        const formattedNumber = number.replace(/\D/g, '');
+        const fullMessage = `${message} ${url}`;
+        return `https://wa.me/${formattedNumber}?text=${encodeURIComponent(fullMessage)}`;
+    }
+
+    static trackWhatsAppShare() {
+        // Track evento genérico
+        globalState.sessionManager.trackEvent('share', {
+            videoId: globalState.videoSet[globalState.currentVideoIndex].id,
+            videoIndex: globalState.currentVideoIndex,
+            shareType: 'whatsapp',
+            timestamp: Date.now()
+        });
+
+        // ADICIONAR: Incrementar cliques no banco
+        this.incrementClicks(
+            globalState.supabaseInstance,
+            globalState.videoSet[globalState.currentVideoIndex].id,
+            globalState.currentVideoIndex + 1
+        );
+
+        VidgetUtils.hapticFeedback('medium');
+        this.hide();
+    }
+}
+
+// ========================= GERENCIADOR DE GESTOS =========================// ========================= GERENCIADOR DE GESTOS =========================
+// ========================= GERENCIADOR DE GESTOS =========================
+// ========================= GESTURE MANAGER COMPLETA E CORRIGIDA =========================
+class GestureManager {
+    static setupTouchEvents() {
+        const container = globalState.vidgetContainer;
+
+        container.addEventListener('touchstart', this.handleTouchStart.bind(this), { passive: false });
+        container.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: false });
+        container.addEventListener('touchend', this.handleTouchEnd.bind(this), { passive: false });
+    }
+
+    // ✅ VERSÃO COMPLETA E CORRIGIDA do shouldIgnoreTouch
+    static shouldIgnoreTouch(target) {
+        console.log('🔍 Verificando touch em:', target.tagName, target.className);
+
+        // Lista COMPLETA de seletores interativos
+        const interactiveSelectors = [
+            'button',
+            'a',
+            '.vidget__btn',
+            '.vidget__btn--close',
+            '.vidget__btn--sound',
+            '.vidget__btn--share',
+            '.vidget__btn--copy',
+            '.vidget__nav-btn',
+            '.vidget__nav-btn--prev',
+            '.vidget__nav-btn--next',
+            '.vidget__share-popup',
+            '.vidget__share-url',
+            '.vidget__share-whatsapp',
+            '.vidget__share-close',
+            '.vidget__article-button',
+            '.vidget__play-btn'
+        ];
+
+        // Verificar o próprio elemento
+        for (const selector of interactiveSelectors) {
+            if (target.matches && target.matches(selector)) {
+                console.log('✅ Ignorando touch - elemento corresponde a:', selector);
+                return true;
+            }
+        }
+
+        // Verificar ancestrais (elemento pai que contém o botão)
+        for (const selector of interactiveSelectors) {
+            if (target.closest && target.closest(selector)) {
+                console.log('✅ Ignorando touch - ancestral corresponde a:', selector);
+                return true;
+            }
+        }
+
+        console.log('❌ Touch NÃO ignorado - elemento interativo não encontrado');
+        return false;
+    }
+
+    // ✅ FUNÇÃO FALTANTE - handleTouchStart CORRIGIDA
+    static handleTouchStart(e) {
+        console.log('📱 Touch start em:', e.target.tagName, e.target.className);
+
+        // CORREÇÃO: Verificação mais rigorosa
+        if (this.shouldIgnoreTouch(e.target)) {
+            console.log('🚫 Touch ignorado - elemento interativo');
+            return; // NÃO chamar preventDefault aqui para botões
+        }
+
+        // Se estiver minimizado, não processar swipes, apenas cliques
+        if (globalState.vidgetContainer.classList.contains('minimized')) {
+            console.log('📦 Widget minimizado - não processar swipes');
+            return;
+        }
+
+        console.log('✅ Iniciando tracking de touch para swipe');
+        globalState.touchStartY = e.touches[0].clientY;
+        globalState.touchStartX = e.touches[0].clientX;
+        globalState.lastTouchY = globalState.touchStartY;
+        globalState.startTime = Date.now();
+        globalState.swipeDirection = null;
+
+        // CORREÇÃO: Só preventDefault se for realmente um swipe gesture
+        e.preventDefault();
+    }
+
+    // ✅ handleTouchMove CORRIGIDA
+    static handleTouchMove(e) {
+        if (globalState.vidgetContainer.classList.contains('minimized')) return;
+        if (!globalState.touchStartY) return;
+
+        // CORREÇÃO: Verificar novamente se deve ignorar
+        if (this.shouldIgnoreTouch(e.target)) {
+            console.log('🚫 Touch move ignorado - elemento interativo');
+            return;
+        }
+
+        globalState.lastTouchY = e.touches[0].clientY;
+        const deltaY = globalState.lastTouchY - globalState.touchStartY;
+        const deltaX = e.touches[0].clientX - globalState.touchStartX;
+
+        // Determinar direção principal
+        if (Math.abs(deltaY) > Math.abs(deltaX)) {
+            globalState.swipeDirection = deltaY > 0 ? 'down' : 'up';
+        }
+
+        console.log('📱 Touch move - deltaY:', deltaY, 'direction:', globalState.swipeDirection);
+        e.preventDefault();
+    }
+
+    // ✅ handleTouchEnd CORRIGIDA
+    static handleTouchEnd(e) {
+        console.log('📱 Touch end em:', e.target.tagName, e.target.className);
+
+        // CORREÇÃO: Verificação mais rigorosa no final também
+        if (this.shouldIgnoreTouch(e.target)) {
+            console.log('🚫 Touch end ignorado - elemento interativo');
+            globalState.touchStartY = 0;
+            globalState.touchStartX = 0;
+            return;
+        }
+
+        if (globalState.vidgetContainer.classList.contains('minimized') || globalState.isProcessingSwipe) return;
+        if (!globalState.touchStartY) return;
+
+        const touchEndY = e.changedTouches[0].clientY;
+        const touchEndX = e.changedTouches[0].clientX;
+        const swipeDistanceY = touchEndY - globalState.touchStartY;
+        const swipeDistanceX = touchEndX - globalState.touchStartX;
+        const swipeTime = Date.now() - globalState.startTime;
+
+        // Calcular velocidade
+        const swipeVelocityY = Math.abs(swipeDistanceY) / swipeTime;
+        const swipeVelocityX = Math.abs(swipeDistanceX) / swipeTime;
+
+        console.log('📊 Swipe metrics:', {
+            distanceY: swipeDistanceY,
+            distanceX: swipeDistanceX,
+            velocityY: swipeVelocityY,
+            time: swipeTime
+        });
+
+        // Reset touch state
+        globalState.touchStartY = 0;
+        globalState.touchStartX = 0;
+
+        // Verificar se é primariamente um swipe vertical
+        const isVerticalSwipe = Math.abs(swipeDistanceY) > Math.abs(swipeDistanceX);
+
+        // Verificar se é um swipe válido (vertical)
+        if (isVerticalSwipe &&
+            (swipeVelocityY > VIDGET_CONFIG.SWIPE_VELOCITY_THRESHOLD ||
+                Math.abs(swipeDistanceY) >= VIDGET_CONFIG.SWIPE_THRESHOLD)) {
+
+            console.log('✅ Swipe válido detectado! Direction:', swipeDistanceY > 0 ? 'down (prev)' : 'up (next)');
+
+            globalState.isProcessingSwipe = true;
+
+            // Swipe para baixo = vídeo anterior, Swipe para cima = próximo vídeo
+            const direction = swipeDistanceY > 0 ? -1 : 1;
+
+            // Feedback haptic
+            VidgetUtils.hapticFeedback('medium');
+
+            // Executar transição
+            VideoTransitions.changeVideo(direction);
+
+            // Reset flag após transição
+            setTimeout(() => {
+                globalState.isProcessingSwipe = false;
+            }, VIDGET_CONFIG.TRANSITION_DURATION + 100);
+        } else {
+            console.log('❌ Swipe inválido - não atende critérios');
+        }
+    }
+
+    // ✅ setupMouseEvents MANTIDA IGUAL
+    static setupMouseEvents() {
+        const container = globalState.vidgetContainer;
+
+        console.log('🚨 GestureManager.setupMouseEvents() CHAMADO!', {
+            container: container,
+            containerExists: !!container,
+            containerId: container?.id
+        });
+
+        if (!container) {
+            console.error('❌ Container não existe!');
+            return;
+        }
+
+        // IMPORTANTE: Remover listeners antigos antes de adicionar novos
+        container.removeEventListener('mousedown', this.handleMouseDown);
+        container.removeEventListener('click', this.handleClick);
+        container.removeEventListener('mouseup', this.handleMouseUp);
+
+        // Adicionar novos listeners com bind correto
+        container.addEventListener('mousedown', this.handleMouseDown.bind(this));
+        container.addEventListener('mouseup', this.handleMouseUp.bind(this));
+        container.addEventListener('click', this.handleClick.bind(this));
+
+        console.log('✅ Event listeners adicionados ao container');
+    }
+
+    // ✅ handleMouseDown MANTIDA IGUAL
+    static handleMouseDown(e) {
+        console.log('📍 handleMouseDown chamado', {
+            target: e.target.tagName,
+            minimized: globalState.vidgetContainer.classList.contains('minimized')
+        });
+
+        if (this.shouldIgnoreTouch(e.target)) return;
+
+        globalState.dragStartTime = Date.now();
+        globalState.isDragging = false;
+        globalState.mouseStartX = e.clientX;
+        globalState.mouseStartY = e.clientY;
+
+        // CORREÇÃO: Só configurar drag se estiver minimizado
+        if (globalState.vidgetContainer.classList.contains('minimized')) {
+            this.setupDragHandlers(e);
+        }
+    }
+
+    // ✅ handleMouseUp MANTIDA IGUAL
+    static handleMouseUp(e) {
+        console.log('📍 handleMouseUp chamado', {
+            isDragging: globalState.isDragging,
+            minimized: globalState.vidgetContainer.classList.contains('minimized'),
+            target: e.target.tagName,
+            timeSinceMouseDown: Date.now() - globalState.dragStartTime
+        });
+
+        const timeSinceMouseDown = Date.now() - globalState.dragStartTime;
+        const movedDistance = Math.sqrt(
+            Math.pow(e.clientX - globalState.mouseStartX, 2) +
+            Math.pow(e.clientY - globalState.mouseStartY, 2)
+        );
+
+        // Se não foi um drag (movimento pequeno e tempo curto)
+        if (timeSinceMouseDown < 200 && movedDistance < 5) {
+            console.log('🎯 Detectado como clique!');
+
+            // Se estiver minimizado, expandir
+            if (globalState.vidgetContainer.classList.contains('minimized')) {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('🎥 Expandindo widget via clique');
+                WidgetStateManager.expand();
+            }
+        }
+
+        // Reset drag state
+        globalState.isDragging = false;
+    }
+
+    // ✅ handleClick MANTIDA IGUAL
+    static handleClick(e) {
+        console.log('📍 handleClick chamado', {
+            isDragging: globalState.isDragging,
+            minimized: globalState.vidgetContainer.classList.contains('minimized'),
+            target: e.target.tagName
+        });
+
+        // Se foi um arrastar, ignorar o clique
+        if (globalState.isDragging) {
+            globalState.isDragging = false;
+            return;
+        }
+
+        // Ignorar cliques em botões e elementos interativos
+        if (this.shouldIgnoreTouch(e.target)) {
+            console.log('🚫 Clique ignorado - elemento interativo');
+            return;
+        }
+
+        // Se clicou no vídeo e estiver expandido, pausar/reproduzir
+        if (!globalState.vidgetContainer.classList.contains('minimized') &&
+            (e.target === globalState.currentVideoElement || e.target.closest('video'))) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (globalState.currentVideoElement.paused) {
+                globalState.currentVideoElement.play();
+                PlayButtonManager.hide();
+            } else {
+                globalState.currentVideoElement.pause();
+                PlayButtonManager.show();
+            }
+        }
+    }
+
+    // ✅ setupDragHandlers MANTIDA IGUAL
+    static setupDragHandlers(e) {
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const rect = globalState.vidgetContainer.getBoundingClientRect();
+        const offsetX = startX - rect.left;
+        const offsetY = startY - rect.top;
+        let hasMoved = false;
+
+        const handleMouseMove = (e) => {
+            const deltaX = Math.abs(e.clientX - startX);
+            const deltaY = Math.abs(e.clientY - startY);
+
+            // Se moveu mais de 5px, considerar como drag
+            if (deltaX > 5 || deltaY > 5) {
+                globalState.isDragging = true;
+                hasMoved = true;
+            }
+
+            // CORREÇÃO: Verificar se ainda está minimizado antes de permitir drag
+            if (!globalState.isDragging || !globalState.vidgetContainer.classList.contains('minimized')) {
+                return;
+            }
+
+            const newX = e.clientX - offsetX;
+            const newY = e.clientY - offsetY;
+
+            // Limitar às bordas da viewport
+            const maxX = window.innerWidth - globalState.vidgetContainer.offsetWidth;
+            const maxY = window.innerHeight - globalState.vidgetContainer.offsetHeight;
+
+            const clampedX = Math.max(0, Math.min(maxX, newX));
+            const clampedY = Math.max(0, Math.min(maxY, newY));
+
+            globalState.vidgetContainer.style.left = clampedX + 'px';
+            globalState.vidgetContainer.style.top = clampedY + 'px';
+            globalState.vidgetContainer.style.right = 'auto';
+            globalState.vidgetContainer.style.bottom = 'auto';
+        };
+
+        const handleMouseUp = (e) => {
+            // CORREÇÃO: Sempre remover os listeners
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+
+            // Limpar referências
+            this.activeMouseMoveHandler = null;
+            this.activeMouseUpHandler = null;
+
+            // CORREÇÃO: Reset completo do estado de drag
+            const timeSinceMouseDown = Date.now() - globalState.dragStartTime;
+            const movedDistance = Math.sqrt(
+                Math.pow(e.clientX - startX, 2) +
+                Math.pow(e.clientY - startY, 2)
+            );
+
+            // Se não foi um drag real (movimento pequeno e tempo curto)
+            if (timeSinceMouseDown < 200 && movedDistance < 5) {
+                globalState.isDragging = false;
+
+                // Se estiver minimizado, expandir
+                if (globalState.vidgetContainer.classList.contains('minimized')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    WidgetStateManager.expand();
+                }
+            } else {
+                // Foi um drag, reset após um tempo
+                setTimeout(() => {
+                    globalState.isDragging = false;
+                }, 100);
+            }
+        };
+
+        // Guardar referências para poder remover depois
+        this.activeMouseMoveHandler = handleMouseMove;
+        this.activeMouseUpHandler = handleMouseUp;
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+    }
+
+    // ✅ clearDragHandlers MANTIDA IGUAL
+    static clearDragHandlers() {
+        globalState.isDragging = false;
+        // Remove qualquer listener que possa ter ficado ativo usando as referências salvas
+        if (this.activeMouseMoveHandler) {
+            document.removeEventListener('mousemove', this.activeMouseMoveHandler);
+            this.activeMouseMoveHandler = null;
+        }
+        if (this.activeMouseUpHandler) {
+            document.removeEventListener('mouseup', this.activeMouseUpHandler);
+            this.activeMouseUpHandler = null;
+        }
+    }
+}
+
+// ========================= ATUALIZAÇÃO DO SETUP DE EVENT LISTENERS =========================
+function setupEventListeners() {
+    console.log('🚨 setupEventListeners() INICIADO!');
+
+    // CORREÇÃO: Event listeners com stopPropagation e stopImmediatePropagation
+
+    // Botão fechar/minimizar
+    const closeBtn = globalState.vidgetContainer.querySelector('.vidget__btn--close');
+    if (closeBtn) {
+        closeBtn.addEventListener('click', (e) => {
+            console.log('Close button clicked');
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            WidgetStateManager.minimize();
+        }, { capture: true }); // CORREÇÃO: Usar capture phase
+    }
+
+    // Botão de som
+    const soundBtn = globalState.vidgetContainer.querySelector('.vidget__btn--sound');
+    if (soundBtn) {
+        soundBtn.addEventListener('click', (e) => {
+            console.log('Sound button clicked');
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            SoundManager.toggle();
+        }, { capture: true });
+    }
+
+    // Botão compartilhar
+    const shareBtn = globalState.vidgetContainer.querySelector('.vidget__btn--share');
+    if (shareBtn) {
+        shareBtn.addEventListener('click', (e) => {
+            console.log('Share button clicked');
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            ShareManager.toggle();
+        }, { capture: true });
+    }
+
+    // Botão copiar link
+    const copyBtn = globalState.vidgetContainer.querySelector('.vidget__btn--copy');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', (e) => {
+            console.log('Copy button clicked');
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            ShareManager.copyLink();
+        }, { capture: true });
+    }
+
+    // CORREÇÃO: Configurar navegação DEPOIS dos botões
+    NavigationManager.setupEventListeners();
+
+    // CORREÇÃO: Configurar eventos de gestos por último
+    GestureManager.setupTouchEvents();
+    GestureManager.setupMouseEvents();
+
+    // Outros event listeners...
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('resize', VidgetUtils.debounce(handleResize, 250));
+}
+
+function getPositionForDevice(metadata) {
+    const isMobile = globalState.isMobile;
+
+    console.log('🔍 Debug getPositionForDevice:', {
+        isMobile,
+        overlayPositionMob: metadata.overlayPositionMob,
+        overlayPosition: metadata.overlayPosition,
+        position: metadata.position
+    });
+
+    if (isMobile) {
+        // Se tem posição específica para mobile, usar ela
+        if (metadata.overlayPositionMob) {
+            console.log('📱 Usando overlayPositionMob:', metadata.overlayPositionMob);
+            return metadata.overlayPositionMob;
+        }
+
+        // Se não tem posição mobile específica, usar a posição desktop no mobile também
+        const fallbackPosition = metadata.overlayPosition || metadata.position || 'right: 20px; bottom: 20px;';
+        console.log('📱 Mobile sem overlayPositionMob - usando overlayPosition:', fallbackPosition);
+        return fallbackPosition;
+    }
+
+    // Desktop sempre usa overlayPosition
+    const desktopPosition = metadata.overlayPosition || metadata.position || 'right: 20px; bottom: 20px;';
+    console.log('🖥️ Desktop - usando overlayPosition:', desktopPosition);
+    return desktopPosition;
+}
+
+// ========================= GERENCIADOR DE ESTADO DO WIDGET =========================
+class WidgetStateManager {
+    static minimize() {
+        if (globalState.toggleLock) return;
+        globalState.toggleLock = true;
+
+        // Limpar qualquer estado de drag
+        GestureManager.clearDragHandlers();
+        globalState.isDragging = false;
+
+        const container = globalState.vidgetContainer;
+        const videoContainer = container.querySelector('.vidget__video-container');
+
+        if (globalState.currentVideoElement) {
+            globalState.currentVideoElement.pause();
+            VideoTransitions.saveCurrentMetrics();
+        }
+
+        container.classList.add('minimized');
+
+        // Resetar estilos inline que podem ter ficado
+        container.style.top = '';
+        container.style.left = '';
+        container.style.right = '';
+        container.style.bottom = '';
+        container.style.width = '';
+        container.style.height = '';
+        container.style.transform = '';
+
+        // NOVA IMPLEMENTAÇÃO: Reaplicar posição baseada no dispositivo
+        const metadata = globalState.videoSet[globalState.currentVideoIndex]?.metadata || {};
+        const positionToApply = getPositionForDevice(metadata);
+        applyPositionToContainer(container, positionToApply);
+
+        this.hideElements([
+            '.vidget__progress-container',
+            '.vidget__article',
+            '.vidget__controls > *:not(.vidget__video-container)',
+            '.vidget__play-btn'
+        ]);
+
+        ProgressBarManager.cleanup();
+        ShareManager.hide();
+        VidgetUtils.hapticFeedback('light');
+
+        setTimeout(() => {
+            globalState.toggleLock = false;
+        }, 500);
+    }
+
+    static applyPositionSettings(metadata) {
+        // NOVA IMPLEMENTAÇÃO: Usar posição baseada no dispositivo
+        const positionToApply = getPositionForDevice(metadata);
+        applyPositionToContainer(globalState.vidgetContainer, positionToApply);
+    }
+
+    static expand() {
+        if (globalState.toggleLock) return;
+        globalState.toggleLock = true;
+
+        // CORREÇÃO 8: Limpar qualquer estado de drag ativo
+        GestureManager.clearDragHandlers();
+        globalState.isDragging = false;
+
+        const container = globalState.vidgetContainer;
+        const metadata = globalState.videoSet[globalState.currentVideoIndex]?.metadata || {};
+        const expandMode = metadata.expandMode || 'free';
+
+        container.classList.remove('minimized');
+
+        if (expandMode === 'full') {
+            this.expandToFullScreen();
+        } else {
+            this.expandToFreeMode();
+        }
+
+        // Mostrar elementos
+        this.showElements([
+            '.vidget__progress-container',
+            '.vidget__article',
+            '.vidget__controls > *'
+        ]);
+
+        // Reinicializar progresso
+        if (globalState.currentVideoElement) {
+            ProgressBarManager.initialize(globalState.currentVideoElement, globalState.currentVideoIndex);
+
+            // Tentar reproduzir
+            globalState.currentVideoElement.muted = false;
+            globalState.currentVideoElement.play().catch(() => {
+                PlayButtonManager.show();
+            });
+
+            SoundManager.updateIcons(false);
+        }
+
+        // Feedback haptic
+        VidgetUtils.hapticFeedback('medium');
+
+        setTimeout(() => {
+            globalState.toggleLock = false;
+        }, 500);
+    }
+
+    static expandToFullScreen() {
+        const container = globalState.vidgetContainer;
+
+        // Criar overlay de fundo
+        this.createFullScreenOverlay();
+
+        // Bloquear scroll da página
+        document.body.style.overflow = 'hidden';
+
+        // Detectar se é mobile
+        const isMobile = globalState.isMobile;
+
+        // Limpar estilos anteriores completamente
+        container.style.cssText = '';
+
+        // Posicionar no centro
+        container.style.position = 'fixed';
+        container.style.zIndex = '999999999';
+
+        if (isMobile) {
+            // Configurações para mobile - tela toda
+            container.style.top = '0';
+            container.style.left = '0';
+            container.style.right = '0';
+            container.style.bottom = '0';
+            container.style.width = '100%';
+            container.style.height = '100%';
+            container.style.borderRadius = '0';
+            container.style.transform = 'none';
+        } else {
+            // Configurações para desktop - centralizado horizontalmente, topo em 5%
+            container.style.top = '4.25%';
+            container.style.left = '37.575%';
+            container.style.transform = 'translateX(-50%)'; // Apenas centralizar horizontalmente
+            container.style.width = '24vw';
+            container.style.height = 'calc(24vw * 1.7692)';
+            container.style.maxWidth = '480px';
+            container.style.maxHeight = '850px';
+            container.style.borderRadius = 'var(--vidget-border-radius)';
+        }
+
+        // Garantir que o container fique visível
+        container.classList.remove('minimized');
+        container.classList.add('loaded');
+    }
+
+
+    static expandToFreeMode() {
+        const container = globalState.vidgetContainer;
+        const metadata = globalState.videoSet[globalState.currentVideoIndex]?.metadata || {};
+
+        // Resetar estilos de fullscreen
+        this.removeFullScreenOverlay();
+        document.body.style.overflow = '';
+
+        // Aplicar posição configurada
+        container.style.position = 'fixed';
+        container.style.transform = '';
+        container.style.width = '';
+        container.style.height = '';
+        container.style.maxWidth = '';
+        container.style.maxHeight = '';
+
+        // Aplicar configurações de posição
+        this.applyPositionSettings(metadata);
+
+        // Para mobile, ocupar tela inteira
+        if (globalState.isMobile) {
+            container.style.top = '0';
+            container.style.left = '0';
+            container.style.right = '0';
+            container.style.bottom = '0';
+            container.style.width = '100%';
+            container.style.height = '100%';
+        }
+    }
+
+    static createFullScreenOverlay() {
+        let overlay = document.getElementById('vidget-fullscreen-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'vidget-fullscreen-overlay';
+            overlay.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.8);
+        backdrop-filter: blur(20px);
+        z-index: 999999998;
+        opacity: 0;
+        transition: opacity 0.4s ease;
+      `;
+            document.body.appendChild(overlay);
+        }
+
+        overlay.style.display = 'block';
+        requestAnimationFrame(() => {
+            overlay.style.opacity = '1';
+        });
+    }
+
+    static removeFullScreenOverlay() {
+        const overlay = document.getElementById('vidget-fullscreen-overlay');
+        if (overlay) {
+            overlay.style.opacity = '0';
+            setTimeout(() => {
+                if (overlay.parentNode) {
+                    overlay.parentNode.removeChild(overlay);
+                }
+            }, 400);
+        }
+    }
+
+    // static applyPositionSettings(metadata) {
+    //     const position = metadata.position || metadata.overlayPosition || 'right: 20px; bottom: 20px;';
+    //     applyPositionToContainer(globalState.vidgetContainer, position);
+    // }
+
+    static hideElements(selectors) {
+        selectors.forEach(selector => {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+                el.style.display = 'none';
+            });
+        });
+    }
+
+    static showElements(selectors) {
+        selectors.forEach(selector => {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+                el.style.display = '';
+            });
+        });
+    }
+}
+
+// ========================= INICIALIZAÇÃO PRINCIPAL =========================
+async function initializeVidget() {
+    try {
+        console.log('🚀 Inicializando Vidget 3.0...');
+
+        // Detectar dispositivo
+        detectDevice();
+
+        // Inicializar estilos
+        VidgetStyles.initStyles();
+
+        // Obter parâmetro de localização
+        const scriptUrl = new URL(document.currentScript.src);
+        const locationParam = decodeURIComponent(scriptUrl.searchParams.get('location'));
+
+        if (!locationParam) {
+            console.warn('⚠️ Parâmetro de localização não encontrado');
+            return;
+        }
+
+        // Criar container
+        createVidgetContainer();
+
+        // Inicializar Supabase
+        await initializeSupabase();
+
+        // Inicializar gerenciadores
+        initializeManagers();
+
+        // Buscar vídeos
+        const videoSet = await fetchVideosByUrl(locationParam);
+
+        if (!videoSet || videoSet.length === 0) {
+            console.log('📭 Nenhum vídeo encontrado para esta URL');
+            hideVidgetContainer();
+            return;
+        }
+
+        // Configurar vídeos
+        globalState.videoSet = videoSet.sort((a, b) => a.id - b.id);
+
+        // Criar interface
+        await createVideoInterface();
+
+        // Carregar primeiro vídeo
+        await loadInitialVideo();
+
+        // Configurar eventos
+        setupEventListeners();
+
+        // Mostrar widget
+        showVidgetContainer();
+
+        console.log('✅ Vidget 3.0 inicializado com sucesso!');
+
+    } catch (error) {
+        console.error('❌ Erro ao inicializar Vidget:', error);
+        hideVidgetContainer();
+    }
+}
+
+function createVidgetContainer() {
+    globalState.vidgetContainer = document.createElement('div');
+    globalState.vidgetContainer.id = 'vidget__container';
+    globalState.vidgetContainer.className = 'minimized';
+    document.body.appendChild(globalState.vidgetContainer);
+}
+
+async function initializeSupabase() {
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js';
+        script.onload = () => {
+            if (typeof supabase === 'undefined') {
+                reject(new Error('Supabase não carregado'));
+                return;
+            }
+
+            globalState.supabaseInstance = supabase.createClient(
+                VIDGET_CONFIG.SUPABASE_URL,
+                VIDGET_CONFIG.SUPABASE_KEY
+            );
+
+            resolve();
+        };
+        script.onerror = () => reject(new Error('Falha ao carregar Supabase'));
+        document.head.appendChild(script);
+    });
+}
+
+function initializeManagers() {
+    globalState.sessionManager = new SessionManager();
+    globalState.videoManager = new VideoManager();
+    globalState.toastManager = new ToastManager();
+
+    setInterval(() => {
+        if (globalState.sessionManager) {
+            globalState.sessionManager.retryFailedMetrics();
+        }
+    }, 30000);
+}
+
+async function fetchVideosByUrl(targetUrl) {
+    try {
+        const cacheKey = `videos_${VidgetUtils.normalizeUrl(targetUrl, true)}`;
+        const cached = globalState.localCache.get(cacheKey);
+        if (cached) {
+            console.log('📦 Vídeos carregados do cache');
+            return cached;
+        }
+        const urlVariants = [
+            VidgetUtils.normalizeUrl(targetUrl, true),
+            VidgetUtils.normalizeUrl(targetUrl, false),
+            targetUrl
+        ];
+
+        // Fazer consulta única com JOIN otimizado
+        const { data: videos, error } = await globalState.supabaseInstance
+            .from('vidget::videos')
+            .select(`
+                id,
+                title,
+                url,
+                metadata,
+                video_set_id,
+                video_sets:video_set_id!inner (
+                    id,
+                    image_url,
+                    status
+                )
+            `)
+            .eq('video_sets.status', 'active')
+            .or(urlVariants.map(url =>
+                `metadata->urlVideoSets.cs.[{"value": "${url}"}],metadata->>urlVideoSet.eq.${url}`
+            ).join(','));
+
+        if (error) {
+            console.error('Erro na consulta otimizada:', error);
+            return null;
+        }
+
+        if (videos && videos.length > 0) {
+            globalState.localCache.set(cacheKey, videos);
+        }
+        // Processar resultados já joinados
+        return videos.map(video => ({
+            ...video,
+            image_url_from_set: video.video_sets?.image_url || null,
+            video_sets: undefined // Limpar para economizar memória
+        }));
+
+    } catch (error) {
+        console.error('Erro ao buscar vídeos:', error);
+        return null;
+    }
+}
+
+// async function queryVideosByUrl(url) {
+//     try {
+//         // Tentar busca em urlVideoSets (array)
+//         let { data: videos, error } = await globalState.supabaseInstance
+//             .from('vidget::videos')
+//             .select('title, url, metadata, id, video_set_id')
+//             .filter('metadata->urlVideoSets', 'cs', `[{"value": "${url}"}]`);
+
+//         // Se não encontrou, tentar em urlVideoSet (string)
+//         if (!videos || videos.length === 0) {
+//             const result = await globalState.supabaseInstance
+//                 .from('vidget::videos')
+//                 .select('title, url, metadata, id, video_set_id')
+//                 .eq('metadata->>urlVideoSet', url);
+
+//             videos = result.data;
+//             error = result.error;
+//         }
+
+//         if (error) throw error;
+//         return videos;
+//     } catch (error) {
+//         console.error('Erro na consulta de vídeos:', error);
+//         return null;
+//     }
+// }
+
+
+// async function enrichVideoData(videos) {
+//     try {
+//         const videoSetIds = [...new Set(videos.map(v => v.video_set_id))];
+
+//         const { data: videoSets, error } = await globalState.supabaseInstance
+//             .from('vidget::video_sets')
+//             .select('id, image_url, status')
+//             .in('id', videoSetIds);
+
+//         if (error) throw error;
+
+//         // ✅ CORREÇÃO: Filtrar apenas video_sets com status 'active'
+//         const activeVideoSets = videoSets.filter(set => set.status === 'active');
+
+//         // ✅ CORREÇÃO: Só retornar vídeos de video_sets ativos
+//         const activeVideos = videos.filter(video => {
+//             return activeVideoSets.some(set => set.id === video.video_set_id);
+//         });
+
+//         // ✅ Se não há vídeos ativos, retornar array vazio
+//         if (activeVideos.length === 0) {
+//             console.log('📭 Nenhum vidget ativo encontrado para esta URL');
+//             return [];
+//         }
+
+//         return activeVideos.map(video => {
+//             const videoSet = activeVideoSets.find(set => set.id === video.video_set_id);
+//             return {
+//                 ...video,
+//                 image_url_from_set: videoSet?.image_url || null
+//             };
+//         });
+//     } catch (error) {
+//         console.error('Erro ao enriquecer dados dos vídeos:', error);
+//         return [];
+//     }
+// }
+
+async function createVideoInterface() {
+    const container = globalState.vidgetContainer;
+    const firstVideo = globalState.videoSet[0];
+    const metadata = firstVideo.metadata || {};
+
+    container.innerHTML = `
+    <div class="vidget__video-container">
+      <div class="vidget__overlay"></div>
+      <div class="vidget__controls">
+        ${createProgressBar()}
+        ${createNavigationButtons()}
+        ${createControlButtons()}
+        ${createArticle(firstVideo)}
+      </div>
+    </div>
+  `;
+
+    // Aplicar configurações de estilo
+    applyWidgetSettings(metadata);
+}
+
+function createProgressBar() {
+    const bars = globalState.videoSet.map(() =>
+        '<div class="vidget__progress-bar"><div class="progress-fill"></div></div>'
+    ).join('');
+
+    return `<div class="vidget__progress-container">${bars}</div>`;
+}
+
+
+function createNavigationButtons() {
+    if (globalState.videoSet.length <= 1) return '';
+
+    return `
+    <div class="vidget__navigation">    
+      <button class="vidget__nav-btn vidget__nav-btn--next"></button>
+      <button class="vidget__nav-btn vidget__nav-btn--prev"></button>
+    </div>
+  `;
+}
+
+function createControlButtons() {
+    const firstVideo = globalState.videoSet[0];
+    const metadata = firstVideo.metadata || {};
+    const showShare = metadata.whatsappButton;
+
+    return `
+    <button class="vidget__btn vidget__btn--close"></button>
+    <button class="vidget__btn vidget__btn--sound sound-off"></button>
+    ${showShare ? '<button class="vidget__btn vidget__btn--share"></button>' : ''}
+    <button class="vidget__btn vidget__btn--copy"></button>
+  `;
+}
+
+function createArticle(videoData) {
+    const metadata = videoData.metadata || {};
+    const isNewFormat = 'showTitle' in metadata;
+
+    // Extrair dados baseado no formato
+    const title = isNewFormat ? (metadata.showTitle ? metadata.title : '') : metadata.title;
+    const description = isNewFormat ? (metadata.showDescription ? metadata.description : '') : metadata.description;
+    const price = isNewFormat ? (metadata.showPrice ? (metadata.price || metadata.productPrice) : '') : metadata.productPrice;
+    const buttonUrl = isNewFormat ? (metadata.showButton ? metadata.buttonUrl : '') : metadata.productUrl;
+    const buttonText = isNewFormat ? (metadata.showButton ? metadata.buttonText || 'Ver produto' : '') : 'Ver produto';
+    const imageUrl = videoData.image_url_from_set || metadata.image_url;
+    const showImage = isNewFormat ? metadata.showThumbnail : !!imageUrl;
+
+    // Se não há conteúdo para mostrar, retornar vazio
+    if (!title && !description && !price && !buttonUrl && !showImage) {
+        return '';
+    }
+
+    return `
+    <div class="vidget__article">
+      <div class="vidget__article-content">
+        ${showImage && imageUrl ? `<img src="${imageUrl}" alt="Produto" class="vidget__article-image">` : ''}
+        <div class="vidget__article-info">
+          ${title ? `<h3 class="vidget__article-title">${title}</h3>` : ''}
+          ${description ? `<p class="vidget__article-description">${VidgetUtils.convertTextToLinks(description)}</p>` : ''}
+          ${price ? `<p class="vidget__article-price">R$ ${price}</p>` : ''}
+          ${buttonUrl ? `<a href="${buttonUrl}" class="vidget__article-button" target="_blank" rel="noopener noreferrer">${buttonText}</a>` : ''}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function applyWidgetSettings(metadata) {
+    const container = globalState.vidgetContainer;
+
+    // Aplicar tamanho
+    const size = (metadata.size || 'M').toLowerCase();
+    container.classList.add(`size-${size}`);
+
+    // Aplicar cor de borda ou sombra
+    const borderColor = metadata.overlayColor;
+    if (borderColor && !metadata.noBorder) {
+        container.style.border = `4px solid #${borderColor}`;
+        container.style.boxShadow = 'none';
+    } else {
+        container.style.border = 'none';
+        container.style.boxShadow = 'var(--vidget-shadow)';
+    }
+
+    container.classList.add('shadow-applied');
+
+    // CORREÇÃO PRINCIPAL: Aplicar posição corretamente
+    const positionToApply = getPositionForDevice(metadata);
+
+    // APLICAR OS ESTILOS IMEDIATAMENTE (era isso que estava faltando)
+    applyPositionToContainer(container, positionToApply);
+
+    console.log('✅ Posição aplicada:', {
+        positionToApply,
+        finalStyles: {
+            top: container.style.top,
+            left: container.style.left,
+            right: container.style.right,
+            bottom: container.style.bottom
+        }
+    });
+}
+function applyPositionToContainer(container, position) {
+    // Resetar posições atuais
+    container.style.top = '';
+    container.style.left = '';
+    container.style.right = '';
+    container.style.bottom = '';
+
+    // Aplicar posições da configuração
+    position.split(';').forEach(rule => {
+        const [property, value] = rule.split(':').map(s => s.trim());
+        if (property && value) {
+            container.style[property] = value;
+        }
+    });
+}
+
+async function loadInitialVideo() {
+    try {
+        const container = globalState.vidgetContainer.querySelector('.vidget__video-container');
+        const firstVideo = globalState.videoSet[0];
+
+        globalState.currentVideoElement = await globalState.videoManager.loadVideo(
+            firstVideo,
+            container,
+            0
+        );
+
+        globalState.currentVideoIndex = 0;
+        globalState.lastTimeUpdate = 0;
+
+        // Pré-carregar vídeos adjacentes
+        globalState.videoManager.preloadAdjacent(0);
+
+    } catch (error) {
+        console.error('Erro ao carregar vídeo inicial:', error);
+        throw error;
+    }
+}
+
+
+
+function handleVisibilityChange() {
+    if (document.hidden) {
+        // Página ficou oculta, pausar vídeo e salvar métricas
+        if (globalState.currentVideoElement && !globalState.currentVideoElement.paused) {
+            globalState.currentVideoElement.pause();
+            VideoTransitions.saveCurrentMetrics();
+        }
+        globalState.sessionManager.flushEvents();
+    } else {
+        // Página ficou visível, tentar retomar reprodução
+        if (globalState.currentVideoElement && globalState.currentVideoElement.paused) {
+            globalState.currentVideoElement.play().catch(console.warn);
+        }
+    }
+}
+
+function handleBeforeUnload() {
+    VideoTransitions.saveCurrentMetrics();
+    globalState.sessionManager.flushEvents();
+}
+
+function handlePageHide() {
+    VideoTransitions.saveCurrentMetrics();
+    globalState.sessionManager.flushEvents();
+}
+
+function handleResize() {
+    // Redetectar se é mobile
+    const wasMobile = globalState.isMobile;
+    detectDevice();
+
+    // Se mudou de/para mobile, reconfigurar interface
+    if (wasMobile !== globalState.isMobile) {
+        applyResponsiveSettings();
+    }
+}
+
+function applyResponsiveSettings() {
+    const container = globalState.vidgetContainer;
+
+    if (globalState.isMobile && !container.classList.contains('minimized')) {
+        // Em mobile expandido, ocupar tela inteira
+        container.style.top = '0';
+        container.style.left = '0';
+        container.style.right = '0';
+        container.style.bottom = '0';
+        container.style.width = '100%';
+        container.style.height = '100%';
+        container.style.borderRadius = '0';
+    } else if (!globalState.isMobile && !container.classList.contains('minimized')) {
+        // Em desktop, usar posição configurada
+        const metadata = globalState.videoSet[globalState.currentVideoIndex]?.metadata || {};
+        WidgetStateManager.applyPositionSettings(metadata);
+        container.style.borderRadius = 'var(--vidget-border-radius)';
+    }
+}
+
+function showVidgetContainer() {
+    const container = globalState.vidgetContainer;
+    container.classList.add('loaded');
+
+    // Animar entrada
+    VidgetUtils.animateElement(container, [
+        { opacity: 0, transform: 'scale(0.8) translateY(20px)' },
+        { opacity: 1, transform: 'scale(1) translateY(0)' }
+    ], { duration: 600, easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' });
+}
+
+function hideVidgetContainer() {
+    const container = globalState.vidgetContainer;
+    if (container) {
+        container.style.display = 'none';
+    }
+}
+
+// ========================= FUNÇÕES DE LIMPEZA =========================
+function cleanup() {
+    // Limpar timers
+    if (globalState.progressInterval) {
+        clearInterval(globalState.progressInterval);
+    }
+    if (globalState.hideTimeout) {
+        clearTimeout(globalState.hideTimeout);
+    }
+    if (globalState.preloadTimeout) {
+        clearTimeout(globalState.preloadTimeout);
+    }
+
+    // Limpar gerenciadores
+    if (globalState.videoManager) {
+        globalState.videoManager.cleanup();
+    }
+    if (globalState.sessionManager) {
+        globalState.sessionManager.flushEvents();
+    }
+    if (globalState.toastManager) {
+        globalState.toastManager.clear();
+    }
+
+    // Limpar eventos
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.removeEventListener('beforeunload', handleBeforeUnload);
+    window.removeEventListener('pagehide', handlePageHide);
+    window.removeEventListener('resize', handleResize);
+
+    // Remover elementos DOM
+    const container = document.getElementById('vidget__container');
+    if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+    }
+
+    const overlay = document.getElementById('vidget-fullscreen-overlay');
+    if (overlay && overlay.parentNode) {
+        overlay.parentNode.removeChild(overlay);
+    }
+
+    // Reset estado global
+    globalState = {
+        supabaseInstance: null,
+        sessionId: null,
+        videoSet: [],
+        currentVideoIndex: 0,
+        currentVideoElement: null,
+        isChangingVideo: false,
+        isProcessingSwipe: false,
+        vidgetContainer: null,
+        isExpanded: false,
+        isDragging: false,
+        toggleLock: false,
+        lastTimeUpdate: 0,
+        startTime: null,
+        metricsBuffer: [],
+        watchedSegments: new Set(),
+        currentSession: {
+            startTime: Date.now(),
+            totalWatchTime: 0,
+            videoInteractions: [],
+            completedVideos: new Set()
+        },
+        touchStartY: 0,
+        touchStartX: 0,
+        lastTouchY: 0,
+        dragStartTime: null,
+        swipeDirection: null,
+        progressInterval: null,
+        hideTimeout: null,
+        preloadTimeout: null,
+        isMobile: false,
+        isIOS: false,
+        isAndroid: false,
+        supportsTouchEvents: false,
+        supportsIntersectionObserver: false
+    };
+
+    console.log('🧹 Vidget limpo completamente');
+}
+
+// ========================= EXPOSIÇÃO DE API PÚBLICA =========================
+window.Vidget = {
+    // Métodos públicos para controle externo
+    minimize: () => WidgetStateManager.minimize(),
+    expand: () => WidgetStateManager.expand(),
+    nextVideo: () => VideoTransitions.changeVideo(1),
+    prevVideo: () => VideoTransitions.changeVideo(-1),
+    toggleSound: () => SoundManager.toggle(),
+    getCurrentVideo: () => globalState.videoSet[globalState.currentVideoIndex],
+    getVideoCount: () => globalState.videoSet.length,
+    isMinimized: () => globalState.vidgetContainer?.classList.contains('minimized'),
+    cleanup: cleanup,
+
+    // Eventos personalizados
+    on: (event, callback) => {
+        document.addEventListener(`vidget:${event}`, callback);
+    },
+
+    off: (event, callback) => {
+        document.removeEventListener(`vidget:${event}`, callback);
+    },
+
+    // Configurações
+    config: VIDGET_CONFIG
+};
+
+// Emitir eventos personalizados
+function emitEvent(eventName, data) {
+    const event = new CustomEvent(`vidget:${eventName}`, {
+        detail: data
+    });
+    document.dispatchEvent(event);
+}
+
+// ========================= INICIALIZAÇÃO AUTOMÁTICA =========================
+// Verificar se o DOM já está carregado
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializeVidget);
+} else {
+    // DOM já carregado, inicializar imediatamente
+    initializeVidget();
+}
+
+// Hot reload para desenvolvimento (remover em produção)
+if (typeof module !== 'undefined' && module.hot) {
+    module.hot.accept();
+    module.hot.dispose(() => {
+        cleanup();
+    });
+}
+
+console.log('📦 Vidget 3.0 carregado e pronto para inicialização');
